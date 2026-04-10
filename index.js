@@ -65,13 +65,13 @@ async function stripRoles(guild, userId) {
 
 function getReason(type) {
   switch (type) {
-    case 'roleCreate': return '7- غير اسم رتبه';
-    case 'roleDelete': return '4- سحب روم';
-    case 'roleUpdate': return '5-عدل على خواص رتبه';
-    case 'channelUpdate': return '1- عدل على روم';
-    case 'channelCreate': return '2- اضاف رتبه جديده';
-    case 'channelDelete': return '4- سحب روم';
-    default: return '1- عدل على روم';
+    case 'roleCreate': return ' غير اسم رتبه';
+    case 'roleDelete': return ' سحب روم';
+    case 'roleUpdate': return 'عدل على خواص رتبه';
+    case 'channelUpdate': return ' عدل على روم';
+    case 'channelCreate': return ' اضاف رتبه جديده';
+    case 'channelDelete': return ' سحب روم';
+    default: return ' عدل على روم';
   }
 }
 
@@ -82,7 +82,7 @@ client.on('roleCreate', async (role) => {
 
   await role.delete().catch(() => {});
   await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, '2- اضاف رتبه جديده');
+  await sendLog(role.guild, user, ' اضاف رتبه جديده');
 });
 
 // ========= ROLE DELETE =========
@@ -97,7 +97,7 @@ client.on('roleDelete', async (role) => {
   }).catch(() => {});
 
   await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, '4- سحب روم');
+  await sendLog(role.guild, user, ' سحب روم');
 });
 
 // ========= ROLE UPDATE =========
@@ -106,10 +106,10 @@ client.on('roleUpdate', async (oldRole, newRole) => {
   if (!user) return;
 
   const changed =
-    oldRole.name !== newRole.name ? '7- غير اسم رتبه' :
-    oldRole.color !== newRole.color ? '3- غير لون رتبه' :
-    oldRole.permissions.bitfield !== newRole.permissions.bitfield ? '5-عدل على خواص رتبه' :
-    '5-عدل على خواص رتبه';
+    oldRole.name !== newRole.name ? ' غير اسم رتبه' :
+    oldRole.color !== newRole.color ? ' غير لون رتبه' :
+    oldRole.permissions.bitfield !== newRole.permissions.bitfield ? 'عدل على خواص رتبه' :
+    'عدل على خواص رتبه';
 
   await newRole.setName(oldRole.name).catch(() => {});
   await newRole.setColor(oldRole.color).catch(() => {});
@@ -125,7 +125,7 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   if (!user) return;
 
   const reason =
-    oldCh.name !== newCh.name ? '6- غير اسم روم' : '1- عدل على روم';
+    oldCh.name !== newCh.name ? ' غير اسم روم' : ' عدل على روم';
 
   try {
     await newCh.setName(oldCh.name).catch(() => {});
@@ -148,7 +148,7 @@ client.on('channelDelete', async (channel) => {
   }).catch(() => {});
 
   await stripRoles(channel.guild, user.id);
-  await sendLog(channel.guild, user, '4- سحب روم');
+  await sendLog(channel.guild, user, ' سحب روم');
 });
 
 // ========= READY =========
