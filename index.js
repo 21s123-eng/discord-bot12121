@@ -6,8 +6,7 @@ const db = require('./db');
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMembers
   ]
 });
 
@@ -16,21 +15,24 @@ const TOKEN = process.env.TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-const cooldown = new Map();
+// ================= RATE SYSTEM =================
+const actionsMap = new Map();
 
 // ================= LOG =================
 function log(guild, text) {
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
   if (!ch) return;
 
-  if (cooldown.has(guild.id)) return;
-  cooldown.set(guild.id, true);
-  setTimeout(() => cooldown.delete(guild.id), 3000);
+  // منع السبام
+  if (actionsMap.has(guild.id)) return;
 
-  ch.send(text + "\n@here").catch(()=>{});
+  actionsMap.set(guild.id, true);
+  setTimeout(() => actionsMap.delete(guild.id), 3000);
+
+  ch.send(`${text}\n@here`).catch(()=>{});
 }
 
-// ================= SAVE BACKUP =================
+// ================= SAVE =================
 function saveBackup(guild) {
   const roles = guild.roles.cache.map(r => ({
     name: r.name,
@@ -85,7 +87,7 @@ async function restore(guild) {
   }
 }
 
-// ================= GET EXECUTOR =================
+// ================= EXECUTOR =================
 async function getUser(guild, type) {
   const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(()=>null);
   if (!logs) return null;
@@ -94,8 +96,9 @@ async function getUser(guild, type) {
   if (!entry) return null;
 
   const user = entry.executor;
-  if (!user || user.id === client.user.id) return null;
-  if (user.id === OWNER_ID) return null;
+  if (!user) return null;
+
+  if (user.id === OWNER_ID || user.id === client.user.id) return null;
 
   if (Date.now() - entry.createdTimestamp > 5000) return null;
 
@@ -111,73 +114,73 @@ async function punish(member) {
   for (const r of roles.values()) {
     await member.roles.remove(r).catch(()=>{});
   }
+
+  // timeout قوي بدل كيك
+  await member.timeout?.(60 * 60 * 1000).catch(()=>{});
 }
 
-// ================= READY =================
+// ================= LOCKDOWN =================
+async function lockGuild(guild) {
+  const everyone = guild.roles.everyone;
+
+  guild.channels.cache.forEach(ch => {
+    ch.permissionOverwrites.edit(everyone, {
+      SendMessages: false,
+      CreateInstantInvite: false,
+      ManageChannels: false
+    }).catch(()=>{});
+  });
+
+  setTimeout(() => unlockGuild(guild), 10000); // يفتح بعد 10 ثواني
+}
+
+async function unlockGuild(guild) {
+  const everyone = guild.roles.everyone;
+
+  guild.channels.cache.forEach(ch => {
+    ch.permissionOverwrites.edit(everyone, {
+      SendMessages: null,
+      CreateInstantInvite: null,
+      ManageChannels: null
+    }).catch(()=>{});
+  });
+}
+
+// ================= DETECT =================
+async function handleAction(type, guild, callback) {
+  const user = await getUser(guild, type);
+  if (!user) return;
+
+  const member = await guild.members.fetch(user.id).catch(()=>null);
+
+  await punish(member);
+  await lockGuild(guild);
+
+  await restore(guild);
+
+  log(guild, `🚨 ACTION BLOCKED by <@${user.id}>`);
+  if (callback) callback();
+}
+
+// ================= EVENTS =================
 client.once('ready', () => {
   console.log(`ONLINE: ${client.user.tag}`);
-
   client.guilds.cache.forEach(saveBackup);
 });
 
-// ================= ROLE CREATE =================
-client.on('roleCreate', async role => {
-  const user = await getUser(role.guild, AuditLogEvent.RoleCreate);
-  if (!user) return;
+client.on('roleCreate', role => handleAction(AuditLogEvent.RoleCreate, role.guild, () => role.delete().catch(()=>{})));
+client.on('roleUpdate', (oldR, newR) => handleAction(AuditLogEvent.RoleUpdate, newR.guild, () => {
+  newR.setName(oldR.name).catch(()=>{});
+  newR.setPermissions(oldR.permissions).catch(()=>{});
+}));
 
-  await role.delete().catch(()=>{});
+client.on('channelUpdate', (oldC, newC) => handleAction(AuditLogEvent.ChannelUpdate, newC.guild, () => {
+  newC.setName(oldC.name).catch(()=>{});
+  newC.setParent(oldC.parentId).catch(()=>{});
+}));
 
-  const member = await role.guild.members.fetch(user.id).catch(()=>null);
-  await punish(member);
-
-  await restore(role.guild);
-
-  log(role.guild, `role created by <@${user.id}>`);
-});
-
-// ================= ROLE UPDATE =================
-client.on('roleUpdate', async (oldRole, newRole) => {
-  const user = await getUser(newRole.guild, AuditLogEvent.RoleUpdate);
-  if (!user) return;
-
-  await newRole.setName(oldRole.name).catch(()=>{});
-  await newRole.setPermissions(oldRole.permissions).catch(()=>{});
-
-  const member = await newRole.guild.members.fetch(user.id).catch(()=>null);
-  await punish(member);
-
-  await restore(newRole.guild);
-
-  log(newRole.guild, `role updated by <@${user.id}>`);
-});
-
-// ================= CHANNEL UPDATE =================
-client.on('channelUpdate', async (oldCh, newCh) => {
-  const user = await getUser(newCh.guild, AuditLogEvent.ChannelUpdate);
-  if (!user) return;
-
-  await newCh.setName(oldCh.name).catch(()=>{});
-  await newCh.setParent(oldCh.parentId).catch(()=>{});
-
-  const member = await newCh.guild.members.fetch(user.id).catch(()=>null);
-  await punish(member);
-
-  await restore(newCh.guild);
-
-  log(newCh.guild, `channel updated by <@${user.id}>`);
-});
-
-// ================= CHANNEL DELETE =================
-client.on('channelDelete', async channel => {
-  const user = await getUser(channel.guild, AuditLogEvent.ChannelDelete);
-  if (!user) return;
-
-  await restore(channel.guild);
-
-  const member = await channel.guild.members.fetch(user.id).catch(()=>null);
-  await punish(member);
-
-  log(channel.guild, `channel deleted by <@${user.id}>`);
-});
+client.on('channelDelete', channel => handleAction(AuditLogEvent.ChannelDelete, channel.guild, () => {
+  restore(channel.guild);
+}));
 
 client.login(TOKEN);
