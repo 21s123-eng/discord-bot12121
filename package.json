@@ -4,6 +4,8 @@
   "main": "index.js",
   "type": "commonjs",
   "dependencies": {
-    "discord.js": "^14.26.2"
+    "discord.js": "^14.26.2",
+    "dotenv": "^16.4.5",
+    "better-sqlite3": "^9.6.0"
   }
 }
