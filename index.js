@@ -1,193 +1,283 @@
-require('dotenv').config();
-const {
-  Client,
-  GatewayIntentBits,
-  AuditLogEvent,
-  PermissionsBitField
-} = require('discord.js');
+import {
+    Client,
+    GatewayIntentBits,
+    AuditLogEvent,
+    ChannelType,
+} from 'discord.js';
 
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
-});
-
-// ================= CONFIG =================
-const TOKEN = process.env.TOKEN;
-
+// ─── Config ────────────────────────────────────────────────────────────────
+const TOKEN = process.env.DISCORD_BOT_TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-const WHITELIST = new Set([OWNER_ID]);
-
-// ================= STATE =================
-const lockState = new Map();
-const actionMap = new Map();
-
-// ================= LOG =================
-function log(guild, msg) {
-  const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
-  if (!ch) return;
-  ch.send(`🧩 ${msg}`).catch(()=>{});
-}
-
-// ================= LOCK =================
-function isLocked(guildId) {
-  return lockState.get(guildId);
-}
-
-function lock(guildId, reason) {
-  lockState.set(guildId, reason);
-}
-
-function unlock(guildId) {
-  lockState.delete(guildId);
-}
-
-// ================= TRACK =================
-function track(userId) {
-  const now = Date.now();
-  const arr = actionMap.get(userId) || [];
-
-  const filtered = arr.filter(t => now - t < 10000);
-  filtered.push(now);
-
-  actionMap.set(userId, filtered);
-  return filtered.length;
-}
-
-// ================= EXECUTOR =================
-async function getExecutor(guild, type) {
-  const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(()=>null);
-  if (!logs) return null;
-
-  const entry = logs.entries.first();
-  if (!entry) return null;
-
-  const user = entry.executor;
-  if (!user) return null;
-
-  if (user.id === client.user.id) return null;
-  if (WHITELIST.has(user.id)) return null;
-
-  return { user, entry };
-}
-
-// ================= 🔥 PUNISH (FINAL) =================
-async function punish(guild, userId, reason) {
-  const member = await guild.members.fetch(userId).catch(()=>null);
-  if (!member) return;
-
-  try {
-    // 🔴 حذف كل الرتب
-    const roles = member.roles.cache.filter(r => r.id !== guild.id);
-    await member.roles.remove(roles).catch(()=>{});
-
-    // 🔇 ميوت 1 ساعة
-    await member.timeout(60 * 60 * 1000, reason).catch(()=>{});
-
-  } catch {}
-}
-
-// ================= CHANNEL PROTECTION =================
-client.on('channelUpdate', async (oldC, newC) => {
-  if (isLocked(newC.guild.id)) return;
-
-  const data = await getExecutor(newC.guild, AuditLogEvent.ChannelUpdate);
-  if (!data) return;
-
-  const { user, entry } = data;
-
-  if (Date.now() - entry.createdTimestamp > 5000) return;
-
-  // 🔥 رجوع فوري للتغييرات
-  await newC.setParent(oldC.parentId).catch(()=>{});
-  await newC.setPosition(oldC.position).catch(()=>{});
-  await newC.setName(oldC.name).catch(()=>{});
-
-  await punish(newC.guild, user.id, 'CHANNEL EDIT');
-
-  const hits = track(user.id);
-  if (hits >= 5) {
-    lock(newC.guild.id, 'ANTI RAID TRIGGERED');
-    log(newC.guild, `🚨 AUTO LOCK ACTIVATED`);
-  }
-
-  log(newC.guild, `❌ Channel edited by: <@${user.id}>`);
+// ─── Client ────────────────────────────────────────────────────────────────
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+    ],
 });
 
-// ================= ROLE UPDATE =================
-client.on('roleUpdate', async (oldR, newR) => {
-  if (isLocked(newR.guild.id)) return;
+// ─── Cooldown map (per guild) to avoid duplicate punishments ───────────────
+// Key: `${guildId}:${executorId}:${reason}`, Value: timestamp
+const recentPunishments = new Map();
+const COOLDOWN_MS = 3000;
 
-  const data = await getExecutor(newR.guild, AuditLogEvent.RoleUpdate);
-  if (!data) return;
+function isPunishmentOnCooldown(guildId, executorId, reason) {
+    const key = `${guildId}:${executorId}:${reason}`;
+    const last = recentPunishments.get(key);
+    if (last && Date.now() - last < COOLDOWN_MS) return true;
+    recentPunishments.set(key, Date.now());
+    return false;
+}
 
-  const { user, entry } = data;
+// ─── Helpers ───────────────────────────────────────────────────────────────
 
-  if (Date.now() - entry.createdTimestamp > 5000) return;
+function isIgnored(userId) {
+    return userId === OWNER_ID || userId === client.user?.id;
+}
 
-  await newR.setPermissions(oldR.permissions).catch(()=>{});
-  await newR.setName(oldR.name).catch(()=>{});
+async function getAuditExecutor(guild, auditLogEvent, targetId = null, delayMs = 1000) {
+    await new Promise((r) => setTimeout(r, delayMs));
+    try {
+        const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 5 });
+        const entry = logs.entries.find((e) =>
+            targetId ? e.target?.id === targetId : true
+        );
+        return entry?.executor ?? null;
+    } catch {
+        return null;
+    }
+}
 
-  await punish(newR.guild, user.id, 'ROLE EDIT');
+async function removeAllRoles(member) {
+    const roles = member.roles.cache
+        .filter((r) => r.id !== member.guild.id)
+        .map((r) => r.id);
+    if (roles.length === 0) return;
+    await member.roles.remove(roles, 'Protection system: unauthorized action').catch(() => {});
+}
 
-  log(newR.guild, `❌ Role edited by: <@${user.id}>`);
-});
+async function sendLog(guild, user, reason) {
+    const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
+    if (!channel) return;
+    const message =
+        `@here\n\nperson : <@${user.id}>\n\nthe reason : ${reason}\n\nID : ${user.id}`;
+    await channel.send(message).catch(() => {});
+}
 
-// ================= CHANNEL DELETE =================
-client.on('channelDelete', async (ch) => {
-  const data = await getExecutor(ch.guild, AuditLogEvent.ChannelDelete);
-  if (!data) return;
+async function punish(guild, executor, reason) {
+    if (isIgnored(executor.id)) return;
+    if (isPunishmentOnCooldown(guild.id, executor.id, reason)) return;
+    try {
+        const member = await guild.members.fetch(executor.id);
+        await Promise.all([
+            removeAllRoles(member),
+            sendLog(guild, executor, reason),
+        ]);
+    } catch (err) {
+        console.error(`[punish] Error for ${executor.id}:`, err.message);
+    }
+}
 
-  const { user } = data;
+// ─── Role Events ───────────────────────────────────────────────────────────
 
-  await punish(ch.guild, user.id, 'DELETE CHANNEL');
-  log(ch.guild, `🚨 Channel deleted by: <@${user.id}>`);
-});
-
-// ================= ROLE CREATE =================
 client.on('roleCreate', async (role) => {
-  const data = await getExecutor(role.guild, AuditLogEvent.RoleCreate);
-  if (!data) return;
-
-  const { user } = data;
-
-  await role.delete().catch(()=>{});
-  await punish(role.guild, user.id, 'ROLE CREATE');
-
-  log(role.guild, `🚨 Role created by: <@${user.id}>`);
+    try {
+        const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
+        if (!executor || isIgnored(executor.id)) return;
+        await role.delete('Protection: reverting unauthorized role creation').catch(() => {});
+        await punish(role.guild, executor, 'اضافة رتبه جديده');
+    } catch (err) {
+        console.error('[roleCreate]', err.message);
+    }
 });
 
-// ================= COMMANDS =================
-client.on('messageCreate', async (msg) => {
-  if (!msg.guild) return;
-  if (!WHITELIST.has(msg.author.id)) return;
-
-  const args = msg.content.split(' ');
-  const cmd = args[0];
-
-  if (cmd === '/lock') {
-    lock(msg.guild.id, 'MANUAL');
-    return msg.reply('🔒 مقفل');
-  }
-
-  if (cmd === '/unlock') {
-    unlock(msg.guild.id);
-    return msg.reply('🔓 مفتوح');
-  }
-
-  if (cmd === '/status') {
-    return msg.reply(isLocked(msg.guild.id) ? '🔴 مقفل' : '🟢 آمن');
-  }
+client.on('roleDelete', async (role) => {
+    try {
+        const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
+        if (!executor || isIgnored(executor.id)) return;
+        await role.guild.roles.create({
+            name: role.name,
+            color: role.color,
+            hoist: role.hoist,
+            permissions: role.permissions,
+            mentionable: role.mentionable,
+            reason: 'Protection: reverting unauthorized role deletion',
+        }).catch(() => {});
+        await punish(role.guild, executor, 'حذف رتبه');
+    } catch (err) {
+        console.error('[roleDelete]', err.message);
+    }
 });
 
-// ================= READY =================
-client.once('ready', () => {
-  console.log(`🏛️ SYSTEM ONLINE: ${client.user.tag}`);
+client.on('roleUpdate', async (oldRole, newRole) => {
+    try {
+        const nameChanged = oldRole.name !== newRole.name;
+        const colorChanged = oldRole.color !== newRole.color;
+        const positionChanged = oldRole.rawPosition !== newRole.rawPosition;
+
+        if (!nameChanged && !colorChanged && !positionChanged) return;
+
+        let reason;
+        if (nameChanged) reason = 'تغيير اسم رتبه';
+        else if (colorChanged) reason = 'تغيير لون رتبه';
+        else reason = 'تغيرر مكان رتبه';
+
+        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+        if (!executor || isIgnored(executor.id)) return;
+
+        // Revert
+        if (nameChanged) {
+            await newRole.setName(oldRole.name, 'Protection: reverting name change').catch(() => {});
+        }
+        if (colorChanged) {
+            await newRole.setColor(oldRole.color, 'Protection: reverting color change').catch(() => {});
+        }
+        if (positionChanged) {
+            await newRole.guild.roles.setPositions([
+                { role: newRole.id, position: oldRole.rawPosition },
+            ]).catch(() => {});
+        }
+
+        await punish(newRole.guild, executor, reason);
+    } catch (err) {
+        console.error('[roleUpdate]', err.message);
+    }
 });
 
-client.login(TOKEN);
+// ─── Channel Events ────────────────────────────────────────────────────────
+
+client.on('channelDelete', async (channel) => {
+    if (!channel.guild) return;
+    try {
+        const isCategory = channel.type === ChannelType.GuildCategory;
+        const executor = await getAuditExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
+        if (!executor || isIgnored(executor.id)) return;
+
+        const reason = isCategory ? 'حذف كاتوقري' : 'حذف روم';
+
+        // Revert: recreate the deleted channel/category
+        const overwrites = channel.permissionOverwrites?.cache?.map((o) => ({
+            id: o.id,
+            type: o.type,
+            allow: o.allow,
+            deny: o.deny,
+        })) ?? [];
+
+        const createOptions = {
+            name: channel.name,
+            type: channel.type,
+            position: channel.rawPosition,
+            permissionOverwrites: overwrites,
+            reason: 'Protection: reverting unauthorized deletion',
+        };
+
+        if (!isCategory) {
+            if (channel.parentId) createOptions.parent = channel.parentId;
+            if (channel.topic) createOptions.topic = channel.topic;
+            if (channel.nsfw !== undefined) createOptions.nsfw = channel.nsfw;
+            if (channel.rateLimitPerUser) createOptions.rateLimitPerUser = channel.rateLimitPerUser;
+            if (channel.type === ChannelType.GuildVoice) {
+                if (channel.bitrate) createOptions.bitrate = channel.bitrate;
+                if (channel.userLimit) createOptions.userLimit = channel.userLimit;
+            }
+        }
+
+        await channel.guild.channels.create(createOptions).catch(() => {});
+        await punish(channel.guild, executor, reason);
+    } catch (err) {
+        console.error('[channelDelete]', err.message);
+    }
+});
+
+client.on('channelUpdate', async (oldChannel, newChannel) => {
+    if (!newChannel.guild) return;
+    try {
+        const isCategory = newChannel.type === ChannelType.GuildCategory;
+
+        const nameChanged = oldChannel.name !== newChannel.name;
+        const positionChanged = oldChannel.rawPosition !== newChannel.rawPosition;
+
+        // Check permission overwrites diff
+        const oldPerms = oldChannel.permissionOverwrites?.cache;
+        const newPerms = newChannel.permissionOverwrites?.cache;
+        let permChanged = false;
+        let permAdded = false;
+
+        if (oldPerms && newPerms) {
+            if (newPerms.size > oldPerms.size) {
+                permChanged = true;
+                permAdded = true;
+            } else if (newPerms.size < oldPerms.size) {
+                permChanged = true;
+                permAdded = false;
+            } else {
+                for (const [id, newOw] of newPerms) {
+                    const oldOw = oldPerms.get(id);
+                    if (!oldOw ||
+                        oldOw.allow.bitfield !== newOw.allow.bitfield ||
+                        oldOw.deny.bitfield !== newOw.deny.bitfield) {
+                        permChanged = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!nameChanged && !positionChanged && !permChanged) return;
+
+        let reason;
+        if (nameChanged) {
+            reason = 'غير اسم روم او شات';
+        } else if (positionChanged) {
+            reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
+        } else if (permChanged) {
+            if (isCategory) {
+                reason = permAdded ? 'اضاف رتبه في كاتوقري' : 'حذف رتبه في كاتوقري';
+            } else {
+                reason = permAdded ? 'اضاف رتبه في روم او شات' : 'حذف رتبه في روم او شات';
+            }
+        } else {
+            return;
+        }
+
+        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+        if (!executor || isIgnored(executor.id)) return;
+
+        // Revert
+        if (nameChanged) {
+            await newChannel.setName(oldChannel.name, 'Protection: reverting name change').catch(() => {});
+        }
+        if (positionChanged) {
+            await newChannel.setPosition(oldChannel.rawPosition, { reason: 'Protection: reverting position change' }).catch(() => {});
+        }
+        if (permChanged && oldPerms) {
+            const oldOverwrites = oldPerms.map((o) => ({
+                id: o.id,
+                type: o.type,
+                allow: o.allow,
+                deny: o.deny,
+            }));
+            await newChannel.permissionOverwrites.set(oldOverwrites, 'Protection: reverting permission change').catch(() => {});
+        }
+
+        await punish(newChannel.guild, executor, reason);
+    } catch (err) {
+        console.error('[channelUpdate]', err.message);
+    }
+});
+
+// ─── Ready ─────────────────────────────────────────────────────────────────
+
+client.once('clientReady', () => {
+    console.log(`[Bot] Online as ${client.user.tag}`);
+    console.log(`[Bot] Protection system active`);
+});
+
+// ─── Login ─────────────────────────────────────────────────────────────────
+
+client.login(TOKEN).catch((err) => {
+    console.error('[Bot] Login failed:', err.message);
+    process.exit(1);
+});
