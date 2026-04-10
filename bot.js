@@ -13,6 +13,14 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildExpressions,
+        GatewayIntentBits.GuildIntegrations,
+        GatewayIntentBits.GuildWebhooks,
+        GatewayIntentBits.GuildInvites,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.GuildPresences,
     ],
 });
 
@@ -88,17 +96,43 @@ async function punish(guild, executor, reason) {
     } catch {}
 }
 
+// --- Our own position tracking to bypass Discord.js cache issues ---
+const storedRolePositions = new Map(); // `${guildId}:${roleId}` -> rawPosition
+
+// --- Deduplication for bulk role position events ---
+// All concurrent roleUpdate events for the same guild share one executor lookup
+const guildPositionChangePromises = new Map(); // guildId -> Promise<executor|null>
+
+// --- Prevent infinite loop when bot restores roles ---
+const botRestoringGuilds = new Set(); // guildId
+
+client.once('clientReady', async () => {
+    console.log(`[Bot] Online as ${client.user.tag}`);
+    for (const [, guild] of client.guilds.cache) {
+        try {
+            const roles = await guild.roles.fetch();
+            for (const [, role] of roles) {
+                storedRolePositions.set(`${guild.id}:${role.id}`, role.rawPosition);
+            }
+        } catch {}
+    }
+    console.log(`[Bot] Protection system active — tracking ${storedRolePositions.size} role positions`);
+});
+
 client.on('roleCreate', async (role) => {
+    storedRolePositions.set(`${role.guild.id}:${role.id}`, role.rawPosition);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
         if (!executor || isIgnored(executor.id)) return;
         await role.delete('Protection: reverting unauthorized role creation').catch(() => {});
+        storedRolePositions.delete(`${role.guild.id}:${role.id}`);
         await punish(role.guild, executor, 'اضافة رتبه جديده');
     } catch {}
 });
 
 client.on('roleDelete', async (role) => {
     const savedPosition = role.rawPosition;
+    storedRolePositions.delete(`${role.guild.id}:${role.id}`);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
         if (!executor || isIgnored(executor.id)) return;
@@ -110,70 +144,72 @@ client.on('roleDelete', async (role) => {
             mentionable: role.mentionable,
             reason: 'Protection: reverting unauthorized role deletion',
         }).catch(() => null);
-        if (recreated && savedPosition > 0) {
-            await recreated.setPosition(savedPosition, { relative: false }).catch(() => {});
+        if (recreated) {
+            storedRolePositions.set(`${role.guild.id}:${recreated.id}`, savedPosition);
+            if (savedPosition > 0) {
+                await recreated.setPosition(savedPosition, { relative: false }).catch(() => {});
+            }
         }
         await punish(role.guild, executor, 'حذف رتبه');
     } catch {}
 });
 
-// Track roles the bot is actively restoring to avoid re-triggering the handler
-const botRestoringRoles = new Set();
-// Track which guild+time windows we already found an executor for (to avoid re-punishing)
-const positionBatchHandled = new Map();
-
 client.on('roleUpdate', async (oldRole, newRole) => {
     try {
+        const storedKey = `${newRole.guild.id}:${newRole.id}`;
+        const storedPosition = storedRolePositions.get(storedKey);
+
         const nameChanged = oldRole.name !== newRole.name;
         const colorChanged = oldRole.color !== newRole.color;
-        const positionChanged = oldRole.rawPosition !== newRole.rawPosition;
+
+        // Use OUR stored position for comparison — Discord.js cache may already be updated
+        const positionChanged =
+            storedPosition !== undefined && storedPosition !== newRole.rawPosition;
+
         if (!nameChanged && !colorChanged && !positionChanged) return;
 
         const oldName = oldRole.name;
         const oldColor = oldRole.color;
-        const oldPosition = oldRole.rawPosition;
+        const oldPosition = storedPosition;
 
         if (positionChanged) {
-            // Skip if bot is currently restoring this role
-            if (botRestoringRoles.has(newRole.id)) return;
-
-            // Use a time window to deduplicate the same "drag" action across multiple events
-            const windowKey = `${newRole.guild.id}:${Math.floor(Date.now() / 4000)}`;
-            const alreadyFoundExecutor = positionBatchHandled.has(windowKey);
-
-            if (!alreadyFoundExecutor) {
-                // This is the first event in the batch — fetch the executor
-                // Use time-based search (not role ID) because Discord only logs the explicitly moved role
-                const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, null);
-
-                if (!executor || isIgnored(executor.id)) {
-                    // Mark as handled (by bot/owner) so we skip other events in this batch
-                    positionBatchHandled.set(windowKey, 'OWNER');
-                    setTimeout(() => positionBatchHandled.delete(windowKey), 8000);
-                    return;
-                }
-
-                positionBatchHandled.set(windowKey, executor.id);
-                setTimeout(() => positionBatchHandled.delete(windowKey), 8000);
-
-                // Restore this role's position
-                botRestoringRoles.add(newRole.id);
-                await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
-                setTimeout(() => botRestoringRoles.delete(newRole.id), 3000);
-
-                // Punish once
-                await punish(newRole.guild, executor, 'تغيرر مكان رتبه');
-            } else {
-                const cachedValue = positionBatchHandled.get(windowKey);
-
-                // If the batch was handled by owner/bot, skip entirely
-                if (cachedValue === 'OWNER') return;
-
-                // Restore this shifted role's position (punishment already done for the batch)
-                botRestoringRoles.add(newRole.id);
-                await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
-                setTimeout(() => botRestoringRoles.delete(newRole.id), 3000);
+            // If the bot is currently restoring this guild's roles, update our record and skip
+            if (botRestoringGuilds.has(newRole.guild.id)) {
+                storedRolePositions.set(storedKey, newRole.rawPosition);
+                return;
             }
+
+            // Share a single executor lookup across all concurrent events for this guild
+            let executorPromise = guildPositionChangePromises.get(newRole.guild.id);
+            if (!executorPromise) {
+                executorPromise = getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, null);
+                guildPositionChangePromises.set(newRole.guild.id, executorPromise);
+                setTimeout(() => guildPositionChangePromises.delete(newRole.guild.id), 10000);
+            }
+
+            const executor = await executorPromise;
+
+            // Re-check after async wait — another event may have started restoration
+            if (botRestoringGuilds.has(newRole.guild.id)) {
+                storedRolePositions.set(storedKey, newRole.rawPosition);
+                return;
+            }
+
+            if (!executor || isIgnored(executor.id)) {
+                // Owner or bot moved this role — accept the new position as legitimate
+                storedRolePositions.set(storedKey, newRole.rawPosition);
+                return;
+            }
+
+            // First event past this point handles restoration and punishment
+            // Subsequent events (from the same batch) will see botRestoringGuilds is set
+            botRestoringGuilds.add(newRole.guild.id);
+            setTimeout(() => botRestoringGuilds.delete(newRole.guild.id), 6000);
+
+            // Restore the moved role to its original position
+            // Cascade from Discord will automatically restore other affected roles
+            await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
+            await punish(newRole.guild, executor, 'تغيرر مكان رتبه');
             return;
         }
 
@@ -234,20 +270,19 @@ client.on('channelDelete', async (channel) => {
     } catch {}
 });
 
-const botRestoringChannels = new Set();
-const channelPositionBatchHandled = new Map();
+const storedChannelPositions = new Map();
+const guildChannelPositionChangePromises = new Map();
+const botRestoringChannelGuilds = new Set();
 
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (!newChannel.guild) return;
     try {
         const isCategory = newChannel.type === ChannelType.GuildCategory;
         const nameChanged = oldChannel.name !== newChannel.name;
-        const positionChanged =
-            oldChannel.rawPosition !== newChannel.rawPosition ||
-            oldChannel.position !== newChannel.position;
 
-        const oldName = oldChannel.name;
-        const oldPosition = oldChannel.rawPosition;
+        const storedKey = `${newChannel.guild.id}:${newChannel.id}`;
+        const storedPosition = storedChannelPositions.get(storedKey) ?? oldChannel.rawPosition;
+        const positionChanged = storedPosition !== newChannel.rawPosition;
 
         const oldPerms = oldChannel.permissionOverwrites?.cache;
         const newPerms = newChannel.permissionOverwrites?.cache;
@@ -272,39 +307,40 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
         if (!nameChanged && !positionChanged && !permChanged) return;
 
-        if (positionChanged) {
-            if (botRestoringChannels.has(newChannel.id)) return;
+        const oldName = oldChannel.name;
+        const oldPosition = storedPosition;
 
-            const windowKey = `ch:${newChannel.guild.id}:${Math.floor(Date.now() / 4000)}`;
-            const alreadyFoundExecutor = channelPositionBatchHandled.has(windowKey);
-
-            if (!alreadyFoundExecutor) {
-                const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, null);
-
-                if (!executor || isIgnored(executor.id)) {
-                    channelPositionBatchHandled.set(windowKey, 'OWNER');
-                    setTimeout(() => channelPositionBatchHandled.delete(windowKey), 8000);
-                    return;
-                }
-
-                channelPositionBatchHandled.set(windowKey, executor.id);
-                setTimeout(() => channelPositionBatchHandled.delete(windowKey), 8000);
-
-                const reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
-
-                botRestoringChannels.add(newChannel.id);
-                await newChannel.setPosition(oldPosition).catch(() => {});
-                setTimeout(() => botRestoringChannels.delete(newChannel.id), 3000);
-
-                await punish(newChannel.guild, executor, reason);
-            } else {
-                const cachedValue = channelPositionBatchHandled.get(windowKey);
-                if (cachedValue === 'OWNER') return;
-
-                botRestoringChannels.add(newChannel.id);
-                await newChannel.setPosition(oldPosition).catch(() => {});
-                setTimeout(() => botRestoringChannels.delete(newChannel.id), 3000);
+        if (positionChanged && !nameChanged && !permChanged) {
+            if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
+                storedChannelPositions.set(storedKey, newChannel.rawPosition);
+                return;
             }
+
+            let executorPromise = guildChannelPositionChangePromises.get(newChannel.guild.id);
+            if (!executorPromise) {
+                executorPromise = getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, null);
+                guildChannelPositionChangePromises.set(newChannel.guild.id, executorPromise);
+                setTimeout(() => guildChannelPositionChangePromises.delete(newChannel.guild.id), 10000);
+            }
+
+            const executor = await executorPromise;
+
+            if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
+                storedChannelPositions.set(storedKey, newChannel.rawPosition);
+                return;
+            }
+
+            if (!executor || isIgnored(executor.id)) {
+                storedChannelPositions.set(storedKey, newChannel.rawPosition);
+                return;
+            }
+
+            botRestoringChannelGuilds.add(newChannel.guild.id);
+            setTimeout(() => botRestoringChannelGuilds.delete(newChannel.guild.id), 6000);
+
+            const reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
+            await newChannel.setPosition(oldPosition).catch(() => {});
+            await punish(newChannel.guild, executor, reason);
             return;
         }
 
@@ -329,9 +365,4 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     } catch {}
 });
 
-client.once('clientReady', () => {
-    console.log(`[Bot] Online as ${client.user.tag}`);
-    console.log(`[Bot] Protection system active`);
-});
-
-client.login(process.env.TOKEN);
+client.login(TOKEN);
