@@ -17,7 +17,7 @@ const client = new Client({
 });
 
 const recentPunishments = new Map();
-const COOLDOWN_MS = 3000;
+const COOLDOWN_MS = 4000;
 
 function isPunishmentOnCooldown(guildId, executorId, reason) {
     const key = `${guildId}:${executorId}:${reason}`;
@@ -40,8 +40,7 @@ async function getAuditExecutor(guild, auditLogEvent, targetId = null, delayMs =
             : null;
         if (!entry) entry = logs.entries.first();
         if (!entry) return null;
-        const age = Math.round((Date.now() - entry.createdTimestamp) / 1000);
-        if (age > 30) return null;
+        if (Date.now() - entry.createdTimestamp > 30000) return null;
         return entry.executor ?? null;
     } catch {
         return null;
@@ -53,7 +52,7 @@ async function removeAllRoles(member) {
         .filter((r) => r.id !== member.guild.id)
         .map((r) => r.id);
     if (roles.length === 0) return;
-    await member.roles.remove(roles, 'Protection system: unauthorized action').catch(() => {});
+    await member.roles.remove(roles, 'Protection system').catch(() => {});
 }
 
 async function sendLog(guild, user, reason) {
@@ -104,15 +103,30 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         const colorChanged = oldRole.color !== newRole.color;
         const positionChanged = oldRole.rawPosition !== newRole.rawPosition;
         if (!nameChanged && !colorChanged && !positionChanged) return;
+
         let reason;
         if (nameChanged) reason = 'تغيير اسم رتبه';
         else if (colorChanged) reason = 'تغيير لون رتبه';
         else reason = 'تغيرر مكان رتبه';
-        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+
+        const useTargetId = (nameChanged || colorChanged) ? newRole.id : null;
+        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
+
         if (nameChanged) await newRole.setName(oldRole.name).catch(() => {});
         if (colorChanged) await newRole.setColor(oldRole.color).catch(() => {});
-        if (positionChanged) await newRole.guild.roles.setPositions([{ role: newRole.id, position: oldRole.rawPosition }]).catch(() => {});
+        if (positionChanged) {
+            const allRoles = [...newRole.guild.roles.cache.values()]
+                .filter((r) => r.id !== newRole.guild.id)
+                .sort((a, b) => a.rawPosition - b.rawPosition);
+            await newRole.guild.roles.setPositions(
+                allRoles.map((r) => ({
+                    role: r.id,
+                    position: r.id === newRole.id ? oldRole.rawPosition : r.rawPosition,
+                }))
+            ).catch(() => {});
+        }
+
         await punish(newRole.guild, executor, reason);
     } catch {}
 });
@@ -124,8 +138,16 @@ client.on('channelDelete', async (channel) => {
         const executor = await getAuditExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
         if (!executor || isIgnored(executor.id)) return;
         const reason = isCategory ? 'حذف كاتوقري' : 'حذف روم';
-        const overwrites = channel.permissionOverwrites?.cache?.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny })) ?? [];
-        const createOptions = { name: channel.name, type: channel.type, position: channel.rawPosition, permissionOverwrites: overwrites, reason: 'Protection: reverting unauthorized deletion' };
+        const overwrites = channel.permissionOverwrites?.cache?.map((o) => ({
+            id: o.id, type: o.type, allow: o.allow, deny: o.deny,
+        })) ?? [];
+        const createOptions = {
+            name: channel.name,
+            type: channel.type,
+            position: channel.rawPosition,
+            permissionOverwrites: overwrites,
+            reason: 'Protection: reverting unauthorized deletion',
+        };
         if (!isCategory) {
             if (channel.parentId) createOptions.parent = channel.parentId;
             if (channel.topic) createOptions.topic = channel.topic;
@@ -146,21 +168,33 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     try {
         const isCategory = newChannel.type === ChannelType.GuildCategory;
         const nameChanged = oldChannel.name !== newChannel.name;
-        const positionChanged = oldChannel.rawPosition !== newChannel.rawPosition || oldChannel.position !== newChannel.position;
+        const positionChanged =
+            oldChannel.rawPosition !== newChannel.rawPosition ||
+            oldChannel.position !== newChannel.position;
+
         const oldPerms = oldChannel.permissionOverwrites?.cache;
         const newPerms = newChannel.permissionOverwrites?.cache;
-        let permChanged = false, permAdded = false;
+        let permChanged = false;
+        let permAdded = false;
+
         if (oldPerms && newPerms) {
             if (newPerms.size > oldPerms.size) { permChanged = true; permAdded = true; }
             else if (newPerms.size < oldPerms.size) { permChanged = true; }
             else {
                 for (const [id, newOw] of newPerms) {
                     const oldOw = oldPerms.get(id);
-                    if (!oldOw || oldOw.allow.bitfield !== newOw.allow.bitfield || oldOw.deny.bitfield !== newOw.deny.bitfield) { permChanged = true; break; }
+                    if (!oldOw ||
+                        oldOw.allow.bitfield !== newOw.allow.bitfield ||
+                        oldOw.deny.bitfield !== newOw.deny.bitfield) {
+                        permChanged = true;
+                        break;
+                    }
                 }
             }
         }
+
         if (!nameChanged && !positionChanged && !permChanged) return;
+
         let reason;
         if (nameChanged) reason = 'غير اسم روم او شات';
         else if (positionChanged) reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
@@ -168,11 +202,19 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
             if (isCategory) reason = permAdded ? 'اضاف رتبه في كاتوقري' : 'حذف رتبه في كاتوقري';
             else reason = permAdded ? 'اضاف رتبه في روم او شات' : 'حذف رتبه في روم او شات';
         } else return;
-        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+
+        const useTargetId = positionChanged ? null : newChannel.id;
+        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
+
         if (nameChanged) await newChannel.setName(oldChannel.name).catch(() => {});
         if (positionChanged) await newChannel.setPosition(oldChannel.rawPosition).catch(() => {});
-        if (permChanged && oldPerms) await newChannel.permissionOverwrites.set(oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))).catch(() => {});
+        if (permChanged && oldPerms) {
+            await newChannel.permissionOverwrites.set(
+                oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))
+            ).catch(() => {});
+        }
+
         await punish(newChannel.guild, executor, reason);
     } catch {}
 });
