@@ -12,18 +12,20 @@ const TOKEN = process.env.TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-const lock = new Map();
+// يمنع التكرار (سبام)
+const cooldown = new Map();
 
 function isOwner(id) {
   return id === OWNER_ID;
 }
 
 async function sendLog(guild, member, reasonText) {
-  const key = `${guild.id}-${member.id}-${reasonText}`;
-  if (lock.has(key)) return;
+  const key = `${guild.id}-${member.id}`;
 
-  lock.set(key, true);
-  setTimeout(() => lock.delete(key), 6000);
+  if (cooldown.has(key)) return;
+  cooldown.set(key, true);
+
+  setTimeout(() => cooldown.delete(key), 5000);
 
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
   if (!ch) return;
@@ -63,18 +65,6 @@ async function stripRoles(guild, userId) {
   }
 }
 
-function getReason(type) {
-  switch (type) {
-    case 'roleCreate': return ' غير اسم رتبه';
-    case 'roleDelete': return ' سحب روم';
-    case 'roleUpdate': return 'عدل على خواص رتبه';
-    case 'channelUpdate': return ' عدل على روم';
-    case 'channelCreate': return ' اضاف رتبه جديده';
-    case 'channelDelete': return ' سحب روم';
-    default: return ' عدل على روم';
-  }
-}
-
 // ========= ROLE CREATE =========
 client.on('roleCreate', async (role) => {
   const user = await getExecutor(role.guild, AuditLogEvent.RoleCreate);
@@ -82,7 +72,7 @@ client.on('roleCreate', async (role) => {
 
   await role.delete().catch(() => {});
   await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, ' اضاف رتبه جديده');
+  await sendLog(role.guild, user, 'اضاف رتبه جديده');
 });
 
 // ========= ROLE DELETE =========
@@ -97,7 +87,7 @@ client.on('roleDelete', async (role) => {
   }).catch(() => {});
 
   await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, ' سحب روم');
+  await sendLog(role.guild, user, 'حذف رتبه');
 });
 
 // ========= ROLE UPDATE =========
@@ -105,18 +95,18 @@ client.on('roleUpdate', async (oldRole, newRole) => {
   const user = await getExecutor(newRole.guild, AuditLogEvent.RoleUpdate);
   if (!user) return;
 
-  const changed =
-    oldRole.name !== newRole.name ? ' غير اسم رتبه' :
-    oldRole.color !== newRole.color ? ' غير لون رتبه' :
-    oldRole.permissions.bitfield !== newRole.permissions.bitfield ? 'عدل على خواص رتبه' :
-    'عدل على خواص رتبه';
+  let reason = 'عدل على خواص رتبه';
+
+  if (oldRole.name !== newRole.name) reason = 'غير اسم رتبه';
+  else if (oldRole.color !== newRole.color) reason = 'غير لون رتبه';
+  else if (oldRole.permissions.bitfield !== newRole.permissions.bitfield) reason = 'عدل على صلاحيات رتبه';
 
   await newRole.setName(oldRole.name).catch(() => {});
   await newRole.setColor(oldRole.color).catch(() => {});
   await newRole.setPermissions(oldRole.permissions).catch(() => {});
 
   await stripRoles(newRole.guild, user.id);
-  await sendLog(newRole.guild, user, changed);
+  await sendLog(newRole.guild, user, reason);
 });
 
 // ========= CHANNEL UPDATE =========
@@ -124,8 +114,9 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   const user = await getExecutor(newCh.guild, AuditLogEvent.ChannelUpdate);
   if (!user) return;
 
-  const reason =
-    oldCh.name !== newCh.name ? ' غير اسم روم' : ' عدل على روم';
+  let reason = 'عدل على روم';
+
+  if (oldCh.name !== newCh.name) reason = 'غير اسم روم';
 
   try {
     await newCh.setName(oldCh.name).catch(() => {});
@@ -135,6 +126,16 @@ client.on('channelUpdate', async (oldCh, newCh) => {
 
   await stripRoles(newCh.guild, user.id);
   await sendLog(newCh.guild, user, reason);
+});
+
+// ========= CHANNEL CREATE =========
+client.on('channelCreate', async (channel) => {
+  const user = await getExecutor(channel.guild, AuditLogEvent.ChannelCreate);
+  if (!user) return;
+
+  await channel.delete().catch(() => {});
+  await stripRoles(channel.guild, user.id);
+  await sendLog(channel.guild, user, 'انشأ روم');
 });
 
 // ========= CHANNEL DELETE =========
@@ -148,7 +149,7 @@ client.on('channelDelete', async (channel) => {
   }).catch(() => {});
 
   await stripRoles(channel.guild, user.id);
-  await sendLog(channel.guild, user, ' سحب روم');
+  await sendLog(channel.guild, user, 'حذف روم');
 });
 
 // ========= READY =========
