@@ -13,14 +13,6 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildModeration,
-        GatewayIntentBits.GuildExpressions,
-        GatewayIntentBits.GuildIntegrations,
-        GatewayIntentBits.GuildWebhooks,
-        GatewayIntentBits.GuildInvites,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildPresences,
     ],
 });
 
@@ -45,26 +37,12 @@ async function getAuditExecutor(guild, auditLogEvent, targetId = null) {
         await new Promise((r) => setTimeout(r, 1000));
         try {
             const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 10 });
-
-            let entry = null;
-
-            if (targetId) {
-                entry = logs.entries.find(
-                    (e) =>
-                        e.target?.id === targetId &&
-                        e.executor?.id !== client.user?.id &&
-                        e.createdTimestamp >= startTime - 8000
-                );
-            }
-
+            let entry = targetId
+                ? logs.entries.find((e) => e.target?.id === targetId)
+                : null;
             if (!entry) {
-                entry = logs.entries.find(
-                    (e) =>
-                        e.createdTimestamp >= startTime - 8000 &&
-                        e.executor?.id !== client.user?.id
-                );
+                entry = logs.entries.find((e) => e.createdTimestamp >= startTime - 5000);
             }
-
             if (entry) return entry.executor ?? null;
         } catch {}
     }
@@ -96,43 +74,17 @@ async function punish(guild, executor, reason) {
     } catch {}
 }
 
-// --- Our own position tracking to bypass Discord.js cache issues ---
-const storedRolePositions = new Map(); // `${guildId}:${roleId}` -> rawPosition
-
-// --- Deduplication for bulk role position events ---
-// All concurrent roleUpdate events for the same guild share one executor lookup
-const guildPositionChangePromises = new Map(); // guildId -> Promise<executor|null>
-
-// --- Prevent infinite loop when bot restores roles ---
-const botRestoringGuilds = new Set(); // guildId
-
-client.once('clientReady', async () => {
-    console.log(`[Bot] Online as ${client.user.tag}`);
-    for (const [, guild] of client.guilds.cache) {
-        try {
-            const roles = await guild.roles.fetch();
-            for (const [, role] of roles) {
-                storedRolePositions.set(`${guild.id}:${role.id}`, role.rawPosition);
-            }
-        } catch {}
-    }
-    console.log(`[Bot] Protection system active — tracking ${storedRolePositions.size} role positions`);
-});
-
 client.on('roleCreate', async (role) => {
-    storedRolePositions.set(`${role.guild.id}:${role.id}`, role.rawPosition);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
         if (!executor || isIgnored(executor.id)) return;
         await role.delete('Protection: reverting unauthorized role creation').catch(() => {});
-        storedRolePositions.delete(`${role.guild.id}:${role.id}`);
         await punish(role.guild, executor, 'اضافة رتبه جديده');
     } catch {}
 });
 
 client.on('roleDelete', async (role) => {
     const savedPosition = role.rawPosition;
-    storedRolePositions.delete(`${role.guild.id}:${role.id}`);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
         if (!executor || isIgnored(executor.id)) return;
@@ -144,11 +96,8 @@ client.on('roleDelete', async (role) => {
             mentionable: role.mentionable,
             reason: 'Protection: reverting unauthorized role deletion',
         }).catch(() => null);
-        if (recreated) {
-            storedRolePositions.set(`${role.guild.id}:${recreated.id}`, savedPosition);
-            if (savedPosition > 0) {
-                await recreated.setPosition(savedPosition, { relative: false }).catch(() => {});
-            }
+        if (recreated && savedPosition > 0) {
+            await recreated.setPosition(savedPosition, { relative: false }).catch(() => {});
         }
         await punish(role.guild, executor, 'حذف رتبه');
     } catch {}
@@ -156,73 +105,27 @@ client.on('roleDelete', async (role) => {
 
 client.on('roleUpdate', async (oldRole, newRole) => {
     try {
-        const storedKey = `${newRole.guild.id}:${newRole.id}`;
-        const storedPosition = storedRolePositions.get(storedKey);
-
         const nameChanged = oldRole.name !== newRole.name;
         const colorChanged = oldRole.color !== newRole.color;
-
-        // Use OUR stored position for comparison — Discord.js cache may already be updated
-        const positionChanged =
-            storedPosition !== undefined && storedPosition !== newRole.rawPosition;
-
+        const positionChanged = oldRole.rawPosition !== newRole.rawPosition;
         if (!nameChanged && !colorChanged && !positionChanged) return;
 
         const oldName = oldRole.name;
         const oldColor = oldRole.color;
-        const oldPosition = storedPosition;
+        const oldPosition = oldRole.rawPosition;
 
-        if (positionChanged) {
-            // If the bot is currently restoring this guild's roles, update our record and skip
-            if (botRestoringGuilds.has(newRole.guild.id)) {
-                storedRolePositions.set(storedKey, newRole.rawPosition);
-                return;
-            }
-
-            // Share a single executor lookup across all concurrent events for this guild
-            let executorPromise = guildPositionChangePromises.get(newRole.guild.id);
-            if (!executorPromise) {
-                executorPromise = getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, null);
-                guildPositionChangePromises.set(newRole.guild.id, executorPromise);
-                setTimeout(() => guildPositionChangePromises.delete(newRole.guild.id), 10000);
-            }
-
-            const executor = await executorPromise;
-
-            // Re-check after async wait — another event may have started restoration
-            if (botRestoringGuilds.has(newRole.guild.id)) {
-                storedRolePositions.set(storedKey, newRole.rawPosition);
-                return;
-            }
-
-            if (!executor || isIgnored(executor.id)) {
-                // Owner or bot moved this role — accept the new position as legitimate
-                storedRolePositions.set(storedKey, newRole.rawPosition);
-                return;
-            }
-
-            // First event past this point handles restoration and punishment
-            // Subsequent events (from the same batch) will see botRestoringGuilds is set
-            botRestoringGuilds.add(newRole.guild.id);
-            setTimeout(() => botRestoringGuilds.delete(newRole.guild.id), 6000);
-
-            // Restore the moved role to its original position
-            // Cascade from Discord will automatically restore other affected roles
-            await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
-            await punish(newRole.guild, executor, 'تغيرر مكان رتبه');
-            return;
-        }
-
-        // Name or color change
         let reason;
         if (nameChanged) reason = 'تغيير اسم رتبه';
-        else reason = 'تغيير لون رتبه';
+        else if (colorChanged) reason = 'تغيير لون رتبه';
+        else reason = 'تغيرر مكان رتبه';
 
-        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+        const useTargetId = positionChanged ? null : newRole.id;
+        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
 
         if (nameChanged) await newRole.setName(oldName).catch(() => {});
         if (colorChanged) await newRole.setColor(oldColor).catch(() => {});
+        if (positionChanged) await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
 
         await punish(newRole.guild, executor, reason);
     } catch {}
@@ -270,19 +173,17 @@ client.on('channelDelete', async (channel) => {
     } catch {}
 });
 
-const storedChannelPositions = new Map();
-const guildChannelPositionChangePromises = new Map();
-const botRestoringChannelGuilds = new Set();
-
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (!newChannel.guild) return;
     try {
         const isCategory = newChannel.type === ChannelType.GuildCategory;
         const nameChanged = oldChannel.name !== newChannel.name;
+        const positionChanged =
+            oldChannel.rawPosition !== newChannel.rawPosition ||
+            oldChannel.position !== newChannel.position;
 
-        const storedKey = `${newChannel.guild.id}:${newChannel.id}`;
-        const storedPosition = storedChannelPositions.get(storedKey) ?? oldChannel.rawPosition;
-        const positionChanged = storedPosition !== newChannel.rawPosition;
+        const oldName = oldChannel.name;
+        const oldPosition = oldChannel.rawPosition;
 
         const oldPerms = oldChannel.permissionOverwrites?.cache;
         const newPerms = newChannel.permissionOverwrites?.cache;
@@ -307,54 +208,20 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
         if (!nameChanged && !positionChanged && !permChanged) return;
 
-        const oldName = oldChannel.name;
-        const oldPosition = storedPosition;
-
-        if (positionChanged && !nameChanged && !permChanged) {
-            if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
-                storedChannelPositions.set(storedKey, newChannel.rawPosition);
-                return;
-            }
-
-            let executorPromise = guildChannelPositionChangePromises.get(newChannel.guild.id);
-            if (!executorPromise) {
-                executorPromise = getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, null);
-                guildChannelPositionChangePromises.set(newChannel.guild.id, executorPromise);
-                setTimeout(() => guildChannelPositionChangePromises.delete(newChannel.guild.id), 10000);
-            }
-
-            const executor = await executorPromise;
-
-            if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
-                storedChannelPositions.set(storedKey, newChannel.rawPosition);
-                return;
-            }
-
-            if (!executor || isIgnored(executor.id)) {
-                storedChannelPositions.set(storedKey, newChannel.rawPosition);
-                return;
-            }
-
-            botRestoringChannelGuilds.add(newChannel.guild.id);
-            setTimeout(() => botRestoringChannelGuilds.delete(newChannel.guild.id), 6000);
-
-            const reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
-            await newChannel.setPosition(oldPosition).catch(() => {});
-            await punish(newChannel.guild, executor, reason);
-            return;
-        }
-
         let reason;
         if (nameChanged) reason = 'غير اسم روم او شات';
+        else if (positionChanged) reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
         else if (permChanged) {
             if (isCategory) reason = permAdded ? 'اضاف رتبه في كاتوقري' : 'حذف رتبه في كاتوقري';
             else reason = permAdded ? 'اضاف رتبه في روم او شات' : 'حذف رتبه في روم او شات';
         } else return;
 
-        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+        const useTargetId = positionChanged ? null : newChannel.id;
+        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
 
         if (nameChanged) await newChannel.setName(oldName).catch(() => {});
+        if (positionChanged) await newChannel.setPosition(oldPosition).catch(() => {});
         if (permChanged && oldPerms) {
             await newChannel.permissionOverwrites.set(
                 oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))
@@ -365,4 +232,9 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     } catch {}
 });
 
-client.login(TOKEN);
+client.once('clientReady', () => {
+    console.log(`[Bot] Online as ${client.user.tag}`);
+    console.log(`[Bot] Protection system active`);
+});
+
+client.login(process.env.TOKEN);
