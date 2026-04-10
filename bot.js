@@ -37,12 +37,23 @@ async function getAuditExecutor(guild, auditLogEvent, targetId = null) {
         await new Promise((r) => setTimeout(r, 1000));
         try {
             const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 10 });
-            let entry = targetId
-                ? logs.entries.find((e) => e.target?.id === targetId)
-                : null;
-            if (!entry) {
-                entry = logs.entries.find((e) => e.createdTimestamp >= startTime - 5000);
+
+            let entry = null;
+
+            if (targetId) {
+                entry = logs.entries.find(
+                    (e) => e.target?.id === targetId && !isIgnored(e.executor?.id ?? '')
+                );
             }
+
+            if (!entry) {
+                entry = logs.entries.find(
+                    (e) =>
+                        e.createdTimestamp >= startTime - 5000 &&
+                        !isIgnored(e.executor?.id ?? '')
+                );
+            }
+
             if (entry) return entry.executor ?? null;
         } catch {}
     }
@@ -103,6 +114,8 @@ client.on('roleDelete', async (role) => {
     } catch {}
 });
 
+const handledPositionChanges = new Map();
+
 client.on('roleUpdate', async (oldRole, newRole) => {
     try {
         const nameChanged = oldRole.name !== newRole.name;
@@ -119,13 +132,29 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         else if (colorChanged) reason = 'تغيير لون رتبه';
         else reason = 'تغيرر مكان رتبه';
 
-        const useTargetId = positionChanged ? null : newRole.id;
-        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, useTargetId);
+        if (positionChanged) {
+            const batchKey = `${newRole.guild.id}:${Math.floor(Date.now() / 3000)}`;
+            const alreadyHandled = handledPositionChanges.has(batchKey);
+
+            await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
+
+            if (alreadyHandled) return;
+
+            handledPositionChanges.set(batchKey, true);
+            setTimeout(() => handledPositionChanges.delete(batchKey), 6000);
+
+            const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
+            if (!executor || isIgnored(executor.id)) return;
+
+            await punish(newRole.guild, executor, reason);
+            return;
+        }
+
+        const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
         if (!executor || isIgnored(executor.id)) return;
 
         if (nameChanged) await newRole.setName(oldName).catch(() => {});
         if (colorChanged) await newRole.setColor(oldColor).catch(() => {});
-        if (positionChanged) await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
 
         await punish(newRole.guild, executor, reason);
     } catch {}
@@ -173,6 +202,8 @@ client.on('channelDelete', async (channel) => {
     } catch {}
 });
 
+const handledChannelPositionChanges = new Map();
+
 client.on('channelUpdate', async (oldChannel, newChannel) => {
     if (!newChannel.guild) return;
     try {
@@ -216,12 +247,28 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
             else reason = permAdded ? 'اضاف رتبه في روم او شات' : 'حذف رتبه في روم او شات';
         } else return;
 
-        const useTargetId = positionChanged ? null : newChannel.id;
-        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, useTargetId);
+        if (positionChanged) {
+            const batchKey = `${newChannel.guild.id}:${Math.floor(Date.now() / 3000)}`;
+            const alreadyHandled = handledChannelPositionChanges.has(batchKey);
+
+            await newChannel.setPosition(oldPosition).catch(() => {});
+
+            if (alreadyHandled) return;
+
+            handledChannelPositionChanges.set(batchKey, true);
+            setTimeout(() => handledChannelPositionChanges.delete(batchKey), 6000);
+
+            const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
+            if (!executor || isIgnored(executor.id)) return;
+
+            await punish(newChannel.guild, executor, reason);
+            return;
+        }
+
+        const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
         if (!executor || isIgnored(executor.id)) return;
 
         if (nameChanged) await newChannel.setName(oldName).catch(() => {});
-        if (positionChanged) await newChannel.setPosition(oldPosition).catch(() => {});
         if (permChanged && oldPerms) {
             await newChannel.permissionOverwrites.set(
                 oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))
