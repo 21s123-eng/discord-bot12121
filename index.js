@@ -1,10 +1,7 @@
 const { Client, GatewayIntentBits, AuditLogEvent, ChannelType } = require('discord.js');
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers
-  ]
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
 const TOKEN = process.env.TOKEN;
@@ -13,35 +10,37 @@ const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
 const cooldown = new Map();
-const ignoreActions = new Set();
+const ignore = new Set();
 
 function isOwner(id) {
   return id === OWNER_ID;
 }
 
-async function sendLog(guild, member, reasonText) {
-  const key = `${guild.id}-${member.id}`;
+// ================= LOG =================
+async function log(guild, user, reason) {
+  const key = guild.id + user.id;
   if (cooldown.has(key)) return;
 
   cooldown.set(key, true);
-  setTimeout(() => cooldown.delete(key), 5000);
+  setTimeout(() => cooldown.delete(key), 4000);
 
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
   if (!ch) return;
 
-  await ch.send(
-`person : <@${member.id}>
+  ch.send(
+`person : <@${user.id}>
 
-the reason : ${reasonText}
+the reason : ${reason}
 
-ID : ${member.id}
+ID : ${user.id}
 
 @here`
-  ).catch(() => {});
+  ).catch(()=>{});
 }
 
-async function getExecutor(guild, type) {
-  const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(() => null);
+// ================= GET EXECUTOR =================
+async function getUser(guild, type) {
+  const logs = await guild.fetchAuditLogs({ type, limit: 1 }).catch(()=>null);
   if (!logs) return null;
 
   const entry = logs.entries.first();
@@ -50,164 +49,125 @@ async function getExecutor(guild, type) {
   const user = entry.executor;
   if (!user) return null;
 
-  if (isOwner(user.id)) return null;
   if (user.id === client.user.id) return null;
+  if (isOwner(user.id)) return null;
 
-  const now = Date.now();
-  if (now - entry.createdTimestamp > 3000) return null;
+  if (Date.now() - entry.createdTimestamp > 3000) return null;
 
   return user;
 }
 
-async function stripRoles(guild, userId) {
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member || isOwner(member.id)) return;
+// ================= STRIP ROLES =================
+async function punish(guild, userId) {
+  const member = await guild.members.fetch(userId).catch(()=>null);
+  if (!member) return;
 
   const roles = member.roles.cache.filter(r => r.id !== guild.id);
-  for (const role of roles.values()) {
-    await member.roles.remove(role).catch(() => {});
+  for (const r of roles.values()) {
+    await member.roles.remove(r).catch(()=>{});
   }
 }
 
-// ========= ROLE CREATE =========
-client.on('roleCreate', async (role) => {
-  const user = await getExecutor(role.guild, AuditLogEvent.RoleCreate);
+// ================= ROLE CREATE =================
+client.on('roleCreate', async role => {
+  const user = await getUser(role.guild, AuditLogEvent.RoleCreate);
   if (!user) return;
 
-  ignoreActions.add(role.guild.id);
+  ignore.add(role.guild.id);
 
-  await role.delete().catch(() => {});
-  await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, 'اضاف رتبه جديده');
+  await role.delete().catch(()=>{});
+  await punish(role.guild, user.id);
+  await log(role.guild, user, 'اضاف رتبه جديده');
 
-  setTimeout(() => ignoreActions.delete(role.guild.id), 3000);
+  setTimeout(()=>ignore.delete(role.guild.id),3000);
 });
 
-// ========= ROLE DELETE =========
-client.on('roleDelete', async (role) => {
-  if (ignoreActions.has(role.guild.id)) return;
-
-  const user = await getExecutor(role.guild, AuditLogEvent.RoleDelete);
-  if (!user) return;
-
-  ignoreActions.add(role.guild.id);
-
-  await role.guild.roles.create({
-    name: role.name,
-    color: role.color,
-    permissions: role.permissions
-  }).catch(() => {});
-
-  await stripRoles(role.guild, user.id);
-  await sendLog(role.guild, user, 'حذف رتبه');
-
-  setTimeout(() => ignoreActions.delete(role.guild.id), 3000);
-});
-
-// ========= ROLE UPDATE =========
+// ================= ROLE UPDATE =================
 client.on('roleUpdate', async (oldRole, newRole) => {
-  if (ignoreActions.has(newRole.guild.id)) return;
+  if (ignore.has(newRole.guild.id)) return;
 
-  const user = await getExecutor(newRole.guild, AuditLogEvent.RoleUpdate);
+  const user = await getUser(newRole.guild, AuditLogEvent.RoleUpdate);
   if (!user) return;
+
+  ignore.add(newRole.guild.id);
 
   let reason = 'عدل على خواص رتبه';
 
   if (oldRole.name !== newRole.name) reason = 'غير اسم رتبه';
   else if (oldRole.color !== newRole.color) reason = 'غير لون رتبه';
-  else if (oldRole.permissions.bitfield !== newRole.permissions.bitfield) reason = 'عدل على صلاحيات رتبه';
   else if (oldRole.position !== newRole.position) reason = 'عدل على خواص رتبه';
 
-  ignoreActions.add(newRole.guild.id);
+  await newRole.setName(oldRole.name).catch(()=>{});
+  await newRole.setColor(oldRole.color).catch(()=>{});
+  await newRole.setPermissions(oldRole.permissions).catch(()=>{});
+  await newRole.setPosition(oldRole.position).catch(()=>{});
 
-  await newRole.setName(oldRole.name).catch(() => {});
-  await newRole.setColor(oldRole.color).catch(() => {});
-  await newRole.setPermissions(oldRole.permissions).catch(() => {});
-  await newRole.setPosition(oldRole.position).catch(() => {});
+  await punish(newRole.guild, user.id);
+  await log(newRole.guild, user, reason);
 
-  await stripRoles(newRole.guild, user.id);
-  await sendLog(newRole.guild, user, reason);
-
-  setTimeout(() => ignoreActions.delete(newRole.guild.id), 3000);
+  setTimeout(()=>ignore.delete(newRole.guild.id),3000);
 });
 
-// ========= CHANNEL UPDATE =========
+// ================= CHANNEL UPDATE =================
 client.on('channelUpdate', async (oldCh, newCh) => {
-  if (ignoreActions.has(newCh.guild.id)) return;
+  if (ignore.has(newCh.guild.id)) return;
 
-  const user = await getExecutor(newCh.guild, AuditLogEvent.ChannelUpdate);
+  const user = await getUser(newCh.guild, AuditLogEvent.ChannelUpdate);
   if (!user) return;
 
-  let reason = 'عدل على روم';
+  ignore.add(newCh.guild.id);
 
-  const oldPerms = JSON.stringify(oldCh.permissionOverwrites.cache);
-  const newPerms = JSON.stringify(newCh.permissionOverwrites.cache);
+  let reason = 'عدل على روم';
 
   if (oldCh.name !== newCh.name) reason = 'غير اسم روم';
   else if (oldCh.position !== newCh.position) reason = 'سحب روم';
   else if (oldCh.parentId !== newCh.parentId) reason = 'سحب روم';
-  else if (oldPerms !== newPerms) reason = 'عدل على روم';
+  else reason = 'عدل على روم';
 
-  ignoreActions.add(newCh.guild.id);
+  await newCh.setName(oldCh.name).catch(()=>{});
+  await newCh.setPosition(oldCh.position).catch(()=>{});
+  await newCh.setParent(oldCh.parentId).catch(()=>{});
+  await newCh.permissionOverwrites.set(oldCh.permissionOverwrites.cache).catch(()=>{});
 
-  try {
-    await newCh.setName(oldCh.name).catch(() => {});
-    await newCh.setPosition(oldCh.position).catch(() => {});
-    await newCh.setParent(oldCh.parentId).catch(() => {});
-    await newCh.permissionOverwrites.set(oldCh.permissionOverwrites.cache).catch(() => {});
-  } catch {}
+  await punish(newCh.guild, user.id);
+  await log(newCh.guild, user, reason);
 
-  await stripRoles(newCh.guild, user.id);
-  await sendLog(newCh.guild, user, reason);
-
-  setTimeout(() => ignoreActions.delete(newCh.guild.id), 3000);
+  setTimeout(()=>ignore.delete(newCh.guild.id),3000);
 });
 
-// ========= CHANNEL DELETE (FIX NO KICK + RESTORE CATEGORY) =========
-client.on('channelDelete', async (channel) => {
-  if (ignoreActions.has(channel.guild.id)) return;
+// ================= CHANNEL DELETE =================
+client.on('channelDelete', async channel => {
+  if (ignore.has(channel.guild.id)) return;
 
-  const user = await getExecutor(channel.guild, AuditLogEvent.ChannelDelete);
+  const user = await getUser(channel.guild, AuditLogEvent.ChannelDelete);
   if (!user) return;
 
-  ignoreActions.add(channel.guild.id);
+  ignore.add(channel.guild.id);
 
   if (channel.type === ChannelType.GuildCategory) {
-    // رجع الكاتقري
-    const newCategory = await channel.guild.channels.create({
+    const newCat = await channel.guild.channels.create({
       name: channel.name,
       type: ChannelType.GuildCategory
-    }).catch(() => null);
+    }).catch(()=>null);
 
-    // رجع الرومات داخلها
-    if (newCategory) {
-      channel.children.cache.forEach(async (ch) => {
-        await channel.guild.channels.create({
-          name: ch.name,
-          type: ch.type,
-          parent: newCategory.id
-        }).catch(() => {});
-      });
-    }
+    await punish(channel.guild, user.id);
+    await log(channel.guild, user, 'حذف كاتقري');
 
-    await stripRoles(channel.guild, user.id);
-    await sendLog(channel.guild, user, 'حذف كاتقري');
   } else {
-    // روم عادي
     await channel.guild.channels.create({
       name: channel.name,
       type: channel.type,
       parent: channel.parentId
-    }).catch(() => {});
+    }).catch(()=>{});
 
-    await stripRoles(channel.guild, user.id);
-    await sendLog(channel.guild, user, 'حذف روم');
+    await punish(channel.guild, user.id);
+    await log(channel.guild, user, 'حذف روم');
   }
 
-  setTimeout(() => ignoreActions.delete(channel.guild.id), 3000);
+  setTimeout(()=>ignore.delete(channel.guild.id),3000);
 });
 
-// ========= READY =========
+// ================= READY =================
 client.once('ready', () => {
   console.log(`ONLINE: ${client.user.tag}`);
 });
