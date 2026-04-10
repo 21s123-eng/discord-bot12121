@@ -17,7 +17,7 @@ const client = new Client({
 });
 
 const recentPunishments = new Map();
-const COOLDOWN_MS = 4000;
+const COOLDOWN_MS = 5000;
 
 function isPunishmentOnCooldown(guildId, executorId, reason) {
     const key = `${guildId}:${executorId}:${reason}`;
@@ -31,20 +31,22 @@ function isIgnored(userId) {
     return userId === OWNER_ID || userId === client.user?.id;
 }
 
-async function getAuditExecutor(guild, auditLogEvent, targetId = null, delayMs = 1500) {
-    await new Promise((r) => setTimeout(r, delayMs));
-    try {
-        const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 5 });
-        let entry = targetId
-            ? logs.entries.find((e) => e.target?.id === targetId)
-            : null;
-        if (!entry) entry = logs.entries.first();
-        if (!entry) return null;
-        if (Date.now() - entry.createdTimestamp > 30000) return null;
-        return entry.executor ?? null;
-    } catch {
-        return null;
+async function getAuditExecutor(guild, auditLogEvent, targetId = null) {
+    const startTime = Date.now();
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+            const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 10 });
+            let entry = targetId
+                ? logs.entries.find((e) => e.target?.id === targetId)
+                : null;
+            if (!entry) {
+                entry = logs.entries.find((e) => e.createdTimestamp >= startTime - 5000);
+            }
+            if (entry) return entry.executor ?? null;
+        } catch {}
     }
+    return null;
 }
 
 async function removeAllRoles(member) {
@@ -72,8 +74,6 @@ async function punish(guild, executor, reason) {
     } catch {}
 }
 
-// ─── Role Events ───────────────────────────────────────────────────────────
-
 client.on('roleCreate', async (role) => {
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
@@ -84,11 +84,11 @@ client.on('roleCreate', async (role) => {
 });
 
 client.on('roleDelete', async (role) => {
+    const savedPosition = role.rawPosition;
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
         if (!executor || isIgnored(executor.id)) return;
-        // Recreate the role then restore its exact original position
-        const newRole = await role.guild.roles.create({
+        const recreated = await role.guild.roles.create({
             name: role.name,
             color: role.color,
             hoist: role.hoist,
@@ -96,10 +96,8 @@ client.on('roleDelete', async (role) => {
             mentionable: role.mentionable,
             reason: 'Protection: reverting unauthorized role deletion',
         }).catch(() => null);
-        if (newRole) {
-            await role.guild.roles.setPositions([
-                { role: newRole.id, position: role.rawPosition },
-            ]).catch(() => {});
+        if (recreated && savedPosition > 0) {
+            await recreated.setPosition(savedPosition, { relative: false }).catch(() => {});
         }
         await punish(role.guild, executor, 'حذف رتبه');
     } catch {}
@@ -112,34 +110,26 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         const positionChanged = oldRole.rawPosition !== newRole.rawPosition;
         if (!nameChanged && !colorChanged && !positionChanged) return;
 
+        const oldName = oldRole.name;
+        const oldColor = oldRole.color;
+        const oldPosition = oldRole.rawPosition;
+
         let reason;
         if (nameChanged) reason = 'تغيير اسم رتبه';
         else if (colorChanged) reason = 'تغيير لون رتبه';
         else reason = 'تغيرر مكان رتبه';
 
-        const useTargetId = (nameChanged || colorChanged) ? newRole.id : null;
+        const useTargetId = positionChanged ? null : newRole.id;
         const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
 
-        if (nameChanged) await newRole.setName(oldRole.name).catch(() => {});
-        if (colorChanged) await newRole.setColor(oldRole.color).catch(() => {});
-        if (positionChanged) {
-            const allRoles = [...newRole.guild.roles.cache.values()]
-                .filter((r) => r.id !== newRole.guild.id)
-                .sort((a, b) => a.rawPosition - b.rawPosition);
-            await newRole.guild.roles.setPositions(
-                allRoles.map((r) => ({
-                    role: r.id,
-                    position: r.id === newRole.id ? oldRole.rawPosition : r.rawPosition,
-                }))
-            ).catch(() => {});
-        }
+        if (nameChanged) await newRole.setName(oldName).catch(() => {});
+        if (colorChanged) await newRole.setColor(oldColor).catch(() => {});
+        if (positionChanged) await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
 
         await punish(newRole.guild, executor, reason);
     } catch {}
 });
-
-// ─── Channel Events ────────────────────────────────────────────────────────
 
 client.on('channelCreate', async (channel) => {
     if (!channel.guild) return;
@@ -192,6 +182,9 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
             oldChannel.rawPosition !== newChannel.rawPosition ||
             oldChannel.position !== newChannel.position;
 
+        const oldName = oldChannel.name;
+        const oldPosition = oldChannel.rawPosition;
+
         const oldPerms = oldChannel.permissionOverwrites?.cache;
         const newPerms = newChannel.permissionOverwrites?.cache;
         let permChanged = false;
@@ -227,8 +220,8 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
         const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, useTargetId);
         if (!executor || isIgnored(executor.id)) return;
 
-        if (nameChanged) await newChannel.setName(oldChannel.name).catch(() => {});
-        if (positionChanged) await newChannel.setPosition(oldChannel.rawPosition).catch(() => {});
+        if (nameChanged) await newChannel.setName(oldName).catch(() => {});
+        if (positionChanged) await newChannel.setPosition(oldPosition).catch(() => {});
         if (permChanged && oldPerms) {
             await newChannel.permissionOverwrites.set(
                 oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))
@@ -239,13 +232,9 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     } catch {}
 });
 
-// ─── Ready ─────────────────────────────────────────────────────────────────
-
 client.once('clientReady', () => {
     console.log(`[Bot] Online as ${client.user.tag}`);
     console.log(`[Bot] Protection system active`);
 });
-
-// ─── Login ─────────────────────────────────────────────────────────────────
 
 client.login(process.env.TOKEN);
