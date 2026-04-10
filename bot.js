@@ -46,6 +46,25 @@ async function debugLog(guild, msg) {
     } catch {}
 }
 
+async function getAuditEntry(guild, auditLogEvent) {
+    const startTime = Date.now();
+    for (let attempt = 1; attempt <= 4; attempt++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+            const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 10 });
+            const entry = logs.entries.find(
+                (e) =>
+                    e.createdTimestamp >= startTime - 8000 &&
+                    e.executor?.id !== client.user?.id
+            );
+            if (entry) {
+                return { executor: entry.executor ?? null, targetId: entry.target?.id ?? null };
+            }
+        } catch {}
+    }
+    return null;
+}
+
 async function getAuditExecutor(guild, auditLogEvent, targetId = null) {
     const startTime = Date.now();
     for (let attempt = 1; attempt <= 4; attempt++) {
@@ -114,8 +133,8 @@ async function punish(guild, executor, reason) {
 }
 
 const storedRolePositions = new Map();
-const guildPositionChangePromises = new Map();
-const botRestoringGuilds = new Set();
+const guildRoleAuditPromises = new Map();
+const botRestoringRoleGuilds = new Set();
 
 client.once('clientReady', async () => {
     console.log(`[Bot] Online as ${client.user.tag}`);
@@ -177,47 +196,55 @@ client.on('roleUpdate', async (oldRole, newRole) => {
 
         if (!nameChanged && !colorChanged && !positionChanged) return;
 
-        const oldName = oldRole.name;
-        const oldColor = oldRole.color;
-        const oldPosition = storedPosition;
-
         if (positionChanged) {
-            if (botRestoringGuilds.has(newRole.guild.id)) {
+            if (botRestoringRoleGuilds.has(newRole.guild.id)) {
                 storedRolePositions.set(storedKey, newRole.rawPosition);
                 return;
             }
 
-            let executorPromise = guildPositionChangePromises.get(newRole.guild.id);
-            if (!executorPromise) {
-                executorPromise = getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, null);
-                guildPositionChangePromises.set(newRole.guild.id, executorPromise);
-                setTimeout(() => guildPositionChangePromises.delete(newRole.guild.id), 10000);
+            let auditPromise = guildRoleAuditPromises.get(newRole.guild.id);
+            if (!auditPromise) {
+                auditPromise = getAuditEntry(newRole.guild, AuditLogEvent.RoleUpdate);
+                guildRoleAuditPromises.set(newRole.guild.id, auditPromise);
+                setTimeout(() => guildRoleAuditPromises.delete(newRole.guild.id), 10000);
             }
 
-            const executor = await executorPromise;
+            const auditResult = await auditPromise;
 
-            if (botRestoringGuilds.has(newRole.guild.id)) {
+            if (botRestoringRoleGuilds.has(newRole.guild.id)) {
                 storedRolePositions.set(storedKey, newRole.rawPosition);
                 return;
             }
 
-            if (!executor) {
-                await debugLog(newRole.guild, `No executor found for position change of ${newRole.name}`);
+            if (!auditResult) {
+                await debugLog(newRole.guild, `No audit entry for position change of ${newRole.name}`);
                 storedRolePositions.set(storedKey, newRole.rawPosition);
                 return;
             }
 
-            if (isIgnored(executor.id)) {
+            const { executor, targetId } = auditResult;
+
+            if (targetId && targetId !== newRole.id) {
                 storedRolePositions.set(storedKey, newRole.rawPosition);
                 return;
             }
 
-            botRestoringGuilds.add(newRole.guild.id);
-            setTimeout(() => botRestoringGuilds.delete(newRole.guild.id), 6000);
+            if (!executor || isIgnored(executor.id)) {
+                storedRolePositions.set(storedKey, newRole.rawPosition);
+                return;
+            }
 
-            await debugLog(newRole.guild, `Role moved: ${newRole.name} | executor: <@${executor.id}> | restoring to ${oldPosition}`);
+            const oldPosition = storedPosition;
+            botRestoringRoleGuilds.add(newRole.guild.id);
+            setTimeout(() => botRestoringRoleGuilds.delete(newRole.guild.id), 8000);
+
+            await debugLog(
+                newRole.guild,
+                `Role moved: ${newRole.name} | executor: <@${executor.id}> | restoring to ${oldPosition}`
+            );
+
             await newRole.setPosition(oldPosition, { relative: false }).catch(() => {});
-            await punish(newRole.guild, executor, 'تغيرر مكان رتبه');
+            await punish(newRole.guild, executor, 'تغيير مكان رتبه');
             return;
         }
 
@@ -227,8 +254,8 @@ client.on('roleUpdate', async (oldRole, newRole) => {
 
         const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
         if (!executor || isIgnored(executor.id)) return;
-        if (nameChanged) await newRole.setName(oldName).catch(() => {});
-        if (colorChanged) await newRole.setColor(oldColor).catch(() => {});
+        if (nameChanged) await newRole.setName(oldRole.name).catch(() => {});
+        if (colorChanged) await newRole.setColor(oldRole.color).catch(() => {});
         await punish(newRole.guild, executor, reason);
     } catch {}
 });
@@ -276,7 +303,7 @@ client.on('channelDelete', async (channel) => {
 });
 
 const storedChannelPositions = new Map();
-const guildChannelPositionChangePromises = new Map();
+const guildChannelAuditPromises = new Map();
 const botRestoringChannelGuilds = new Set();
 
 client.on('channelUpdate', async (oldChannel, newChannel) => {
@@ -311,31 +338,47 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
         if (!nameChanged && !positionChanged && !permChanged) return;
 
-        const oldName = oldChannel.name;
-        const oldPosition = storedPosition;
-
         if (positionChanged && !nameChanged && !permChanged) {
             if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
                 storedChannelPositions.set(storedKey, newChannel.rawPosition);
                 return;
             }
-            let executorPromise = guildChannelPositionChangePromises.get(newChannel.guild.id);
-            if (!executorPromise) {
-                executorPromise = getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, null);
-                guildChannelPositionChangePromises.set(newChannel.guild.id, executorPromise);
-                setTimeout(() => guildChannelPositionChangePromises.delete(newChannel.guild.id), 10000);
+
+            let auditPromise = guildChannelAuditPromises.get(newChannel.guild.id);
+            if (!auditPromise) {
+                auditPromise = getAuditEntry(newChannel.guild, AuditLogEvent.ChannelUpdate);
+                guildChannelAuditPromises.set(newChannel.guild.id, auditPromise);
+                setTimeout(() => guildChannelAuditPromises.delete(newChannel.guild.id), 10000);
             }
-            const executor = await executorPromise;
+
+            const auditResult = await auditPromise;
+
             if (botRestoringChannelGuilds.has(newChannel.guild.id)) {
                 storedChannelPositions.set(storedKey, newChannel.rawPosition);
                 return;
             }
+
+            if (!auditResult) {
+                storedChannelPositions.set(storedKey, newChannel.rawPosition);
+                return;
+            }
+
+            const { executor, targetId } = auditResult;
+
+            if (targetId && targetId !== newChannel.id) {
+                storedChannelPositions.set(storedKey, newChannel.rawPosition);
+                return;
+            }
+
             if (!executor || isIgnored(executor.id)) {
                 storedChannelPositions.set(storedKey, newChannel.rawPosition);
                 return;
             }
+
+            const oldPosition = storedPosition;
             botRestoringChannelGuilds.add(newChannel.guild.id);
-            setTimeout(() => botRestoringChannelGuilds.delete(newChannel.guild.id), 6000);
+            setTimeout(() => botRestoringChannelGuilds.delete(newChannel.guild.id), 8000);
+
             const reason = isCategory ? 'حرك كاتوقري' : 'حرك روم';
             await newChannel.setPosition(oldPosition).catch(() => {});
             await punish(newChannel.guild, executor, reason);
@@ -351,7 +394,7 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
         const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
         if (!executor || isIgnored(executor.id)) return;
-        if (nameChanged) await newChannel.setName(oldName).catch(() => {});
+        if (nameChanged) await newChannel.setName(oldChannel.name).catch(() => {});
         if (permChanged && oldPerms) {
             await newChannel.permissionOverwrites.set(
                 oldPerms.map((o) => ({ id: o.id, type: o.type, allow: o.allow, deny: o.deny }))
