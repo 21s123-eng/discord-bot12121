@@ -35,12 +35,12 @@ function saveBackup(guild) {
   const roles = guild.roles.cache.map(r => ({
     name: r.name,
     color: r.color,
-    permissions: r.permissions.bitfield
+    permissions: r.permissions.bitfield.toString()
   }));
 
   const channels = guild.channels.cache.map(c => ({
     name: c.name,
-    type: c.type,
+    type: Number(c.type),
     parentId: c.parentId
   }));
 
@@ -64,7 +64,7 @@ async function restore(guild) {
         await guild.roles.create({
           name: r.name,
           color: r.color,
-          permissions: new PermissionsBitField(r.permissions)
+          permissions: new PermissionsBitField(BigInt(r.permissions))
         }).catch(()=>{});
       }
     }
@@ -77,7 +77,7 @@ async function restore(guild) {
       if (!guild.channels.cache.find(x => x.name === c.name)) {
         await guild.channels.create({
           name: c.name,
-          type: c.type,
+          type: Number(c.type),
           parent: c.parentId
         }).catch(()=>{});
       }
