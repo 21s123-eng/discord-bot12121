@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, AuditLogEvent } = require('discord.js');
+const { Client, GatewayIntentBits, AuditLogEvent, ChannelType } = require('discord.js');
 
 const client = new Client({
   intents: [
@@ -37,7 +37,9 @@ async function sendLog(guild, member, reasonText) {
 
 the reason : ${reasonText}
 
-ID : ${member.id}`
+ID : ${member.id}
+
+@here`
   ).catch(() => {});
 }
 
@@ -51,13 +53,9 @@ async function getExecutor(guild, type) {
   const user = entry.executor;
   if (!user) return null;
 
-  // تجاهل الاونر
   if (isOwner(user.id)) return null;
-
-  // تجاهل البوت نفسه
   if (user.id === client.user.id) return null;
 
-  // 🔥 تجاهل العمليات القديمة
   const now = Date.now();
   if (now - entry.createdTimestamp > 3000) return null;
 
@@ -121,12 +119,14 @@ client.on('roleUpdate', async (oldRole, newRole) => {
   if (oldRole.name !== newRole.name) reason = 'غير اسم رتبه';
   else if (oldRole.color !== newRole.color) reason = 'غير لون رتبه';
   else if (oldRole.permissions.bitfield !== newRole.permissions.bitfield) reason = 'عدل على صلاحيات رتبه';
+  else if (oldRole.position !== newRole.position) reason = 'عدل على خواص رتبه';
 
   ignoreActions.add(newRole.guild.id);
 
   await newRole.setName(oldRole.name).catch(() => {});
   await newRole.setColor(oldRole.color).catch(() => {});
   await newRole.setPermissions(oldRole.permissions).catch(() => {});
+  await newRole.setPosition(oldRole.position).catch(() => {});
 
   await stripRoles(newRole.guild, user.id);
   await sendLog(newRole.guild, user, reason);
@@ -142,13 +142,18 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   if (!user) return;
 
   let reason = 'عدل على روم';
+
   if (oldCh.name !== newCh.name) reason = 'غير اسم روم';
+  else if (oldCh.position !== newCh.position) reason = 'سحب روم';
+  else if (oldCh.parentId !== newCh.parentId) reason = 'سحب روم';
+  else if (JSON.stringify(oldCh.permissionOverwrites.cache) !== JSON.stringify(newCh.permissionOverwrites.cache)) reason = 'عدل على روم';
 
   ignoreActions.add(newCh.guild.id);
 
   try {
     await newCh.setName(oldCh.name).catch(() => {});
     await newCh.setPosition(oldCh.position).catch(() => {});
+    await newCh.setParent(oldCh.parentId).catch(() => {});
     await newCh.permissionOverwrites.set(oldCh.permissionOverwrites.cache).catch(() => {});
   } catch {}
 
@@ -156,22 +161,6 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   await sendLog(newCh.guild, user, reason);
 
   setTimeout(() => ignoreActions.delete(newCh.guild.id), 3000);
-});
-
-// ========= CHANNEL CREATE =========
-client.on('channelCreate', async (channel) => {
-  if (ignoreActions.has(channel.guild.id)) return;
-
-  const user = await getExecutor(channel.guild, AuditLogEvent.ChannelCreate);
-  if (!user) return;
-
-  ignoreActions.add(channel.guild.id);
-
-  await channel.delete().catch(() => {});
-  await stripRoles(channel.guild, user.id);
-  await sendLog(channel.guild, user, 'انشأ روم');
-
-  setTimeout(() => ignoreActions.delete(channel.guild.id), 3000);
 });
 
 // ========= CHANNEL DELETE =========
@@ -185,7 +174,8 @@ client.on('channelDelete', async (channel) => {
 
   await channel.guild.channels.create({
     name: channel.name,
-    type: channel.type
+    type: channel.type,
+    parent: channel.parentId
   }).catch(() => {});
 
   await stripRoles(channel.guild, user.id);
