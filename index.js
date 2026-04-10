@@ -12,10 +12,7 @@ const TOKEN = process.env.TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-// منع السبام
 const cooldown = new Map();
-
-// 🔥 منع البوت يعاقب نفسه (تجاهل مؤقت)
 const ignoreActions = new Set();
 
 function isOwner(id) {
@@ -143,10 +140,13 @@ client.on('channelUpdate', async (oldCh, newCh) => {
 
   let reason = 'عدل على روم';
 
+  const oldPerms = JSON.stringify(oldCh.permissionOverwrites.cache);
+  const newPerms = JSON.stringify(newCh.permissionOverwrites.cache);
+
   if (oldCh.name !== newCh.name) reason = 'غير اسم روم';
   else if (oldCh.position !== newCh.position) reason = 'سحب روم';
   else if (oldCh.parentId !== newCh.parentId) reason = 'سحب روم';
-  else if (JSON.stringify(oldCh.permissionOverwrites.cache) !== JSON.stringify(newCh.permissionOverwrites.cache)) reason = 'عدل على روم';
+  else if (oldPerms !== newPerms) reason = 'عدل على روم';
 
   ignoreActions.add(newCh.guild.id);
 
@@ -163,7 +163,7 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   setTimeout(() => ignoreActions.delete(newCh.guild.id), 3000);
 });
 
-// ========= CHANNEL DELETE =========
+// ========= CHANNEL DELETE (FIX NO KICK + RESTORE CATEGORY) =========
 client.on('channelDelete', async (channel) => {
   if (ignoreActions.has(channel.guild.id)) return;
 
@@ -172,14 +172,37 @@ client.on('channelDelete', async (channel) => {
 
   ignoreActions.add(channel.guild.id);
 
-  await channel.guild.channels.create({
-    name: channel.name,
-    type: channel.type,
-    parent: channel.parentId
-  }).catch(() => {});
+  if (channel.type === ChannelType.GuildCategory) {
+    // رجع الكاتقري
+    const newCategory = await channel.guild.channels.create({
+      name: channel.name,
+      type: ChannelType.GuildCategory
+    }).catch(() => null);
 
-  await stripRoles(channel.guild, user.id);
-  await sendLog(channel.guild, user, 'حذف روم');
+    // رجع الرومات داخلها
+    if (newCategory) {
+      channel.children.cache.forEach(async (ch) => {
+        await channel.guild.channels.create({
+          name: ch.name,
+          type: ch.type,
+          parent: newCategory.id
+        }).catch(() => {});
+      });
+    }
+
+    await stripRoles(channel.guild, user.id);
+    await sendLog(channel.guild, user, 'حذف كاتقري');
+  } else {
+    // روم عادي
+    await channel.guild.channels.create({
+      name: channel.name,
+      type: channel.type,
+      parent: channel.parentId
+    }).catch(() => {});
+
+    await stripRoles(channel.guild, user.id);
+    await sendLog(channel.guild, user, 'حذف روم');
+  }
 
   setTimeout(() => ignoreActions.delete(channel.guild.id), 3000);
 });
