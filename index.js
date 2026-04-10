@@ -19,7 +19,6 @@ const client = new Client({
 });
 
 // ─── Cooldown map (per guild) to avoid duplicate punishments ───────────────
-// Key: `${guildId}:${executorId}:${reason}`, Value: timestamp
 const recentPunishments = new Map();
 const COOLDOWN_MS = 3000;
 
@@ -37,15 +36,21 @@ function isIgnored(userId) {
     return userId === OWNER_ID || userId === client.user?.id;
 }
 
-async function getAuditExecutor(guild, auditLogEvent, targetId = null, delayMs = 1000) {
+async function getAuditExecutor(guild, auditLogEvent, targetId = null, delayMs = 1500) {
     await new Promise((r) => setTimeout(r, delayMs));
     try {
         const logs = await guild.fetchAuditLogs({ type: auditLogEvent, limit: 5 });
         const entry = logs.entries.find((e) =>
             targetId ? e.target?.id === targetId : true
         );
-        return entry?.executor ?? null;
-    } catch {
+        if (!entry) {
+            console.log(`[audit] No entry found for event ${auditLogEvent}, targetId=${targetId}`);
+            return null;
+        }
+        console.log(`[audit] Found executor: ${entry.executor?.tag} (${entry.executor?.id})`);
+        return entry.executor ?? null;
+    } catch (err) {
+        console.error(`[audit] Failed to fetch logs:`, err.message);
         return null;
     }
 }
@@ -54,27 +59,46 @@ async function removeAllRoles(member) {
     const roles = member.roles.cache
         .filter((r) => r.id !== member.guild.id)
         .map((r) => r.id);
-    if (roles.length === 0) return;
-    await member.roles.remove(roles, 'Protection system: unauthorized action').catch(() => {});
+    if (roles.length === 0) {
+        console.log(`[roles] ${member.user.tag} has no roles to remove`);
+        return;
+    }
+    console.log(`[roles] Removing ${roles.length} roles from ${member.user.tag}`);
+    await member.roles.remove(roles, 'Protection system: unauthorized action').catch((err) => {
+        console.error(`[roles] Failed to remove roles:`, err.message);
+    });
 }
 
 async function sendLog(guild, user, reason) {
     const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
-    if (!channel) return;
+    if (!channel) {
+        console.error(`[log] Log channel ${LOG_CHANNEL_ID} not found in cache`);
+        return;
+    }
     const message =
         `@here\n\nperson : <@${user.id}>\n\nthe reason : ${reason}\n\nID : ${user.id}`;
-    await channel.send(message).catch(() => {});
+    await channel.send(message).catch((err) => {
+        console.error(`[log] Failed to send log message:`, err.message);
+    });
 }
 
 async function punish(guild, executor, reason) {
-    if (isIgnored(executor.id)) return;
-    if (isPunishmentOnCooldown(guild.id, executor.id, reason)) return;
+    if (isIgnored(executor.id)) {
+        console.log(`[punish] Ignoring user ${executor.id} (owner or bot)`);
+        return;
+    }
+    if (isPunishmentOnCooldown(guild.id, executor.id, reason)) {
+        console.log(`[punish] Cooldown active for ${executor.id} / ${reason}`);
+        return;
+    }
+    console.log(`[punish] Punishing ${executor.tag} (${executor.id}) for: ${reason}`);
     try {
         const member = await guild.members.fetch(executor.id);
         await Promise.all([
             removeAllRoles(member),
             sendLog(guild, executor, reason),
         ]);
+        console.log(`[punish] Done for ${executor.tag}`);
     } catch (err) {
         console.error(`[punish] Error for ${executor.id}:`, err.message);
     }
@@ -83,6 +107,7 @@ async function punish(guild, executor, reason) {
 // ─── Role Events ───────────────────────────────────────────────────────────
 
 client.on('roleCreate', async (role) => {
+    console.log(`[roleCreate] Role created: ${role.name}`);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
         if (!executor || isIgnored(executor.id)) return;
@@ -94,6 +119,7 @@ client.on('roleCreate', async (role) => {
 });
 
 client.on('roleDelete', async (role) => {
+    console.log(`[roleDelete] Role deleted: ${role.name}`);
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
         if (!executor || isIgnored(executor.id)) return;
@@ -119,6 +145,8 @@ client.on('roleUpdate', async (oldRole, newRole) => {
 
         if (!nameChanged && !colorChanged && !positionChanged) return;
 
+        console.log(`[roleUpdate] Role "${newRole.name}" changed — name:${nameChanged} color:${colorChanged} pos:${positionChanged}`);
+
         let reason;
         if (nameChanged) reason = 'تغيير اسم رتبه';
         else if (colorChanged) reason = 'تغيير لون رتبه';
@@ -127,13 +155,8 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         const executor = await getAuditExecutor(newRole.guild, AuditLogEvent.RoleUpdate, newRole.id);
         if (!executor || isIgnored(executor.id)) return;
 
-        // Revert
-        if (nameChanged) {
-            await newRole.setName(oldRole.name, 'Protection: reverting name change').catch(() => {});
-        }
-        if (colorChanged) {
-            await newRole.setColor(oldRole.color, 'Protection: reverting color change').catch(() => {});
-        }
+        if (nameChanged) await newRole.setName(oldRole.name, 'Protection: reverting name change').catch(() => {});
+        if (colorChanged) await newRole.setColor(oldRole.color, 'Protection: reverting color change').catch(() => {});
         if (positionChanged) {
             await newRole.guild.roles.setPositions([
                 { role: newRole.id, position: oldRole.rawPosition },
@@ -150,6 +173,7 @@ client.on('roleUpdate', async (oldRole, newRole) => {
 
 client.on('channelDelete', async (channel) => {
     if (!channel.guild) return;
+    console.log(`[channelDelete] Channel deleted: #${channel.name} (${channel.type})`);
     try {
         const isCategory = channel.type === ChannelType.GuildCategory;
         const executor = await getAuditExecutor(channel.guild, AuditLogEvent.ChannelDelete, channel.id);
@@ -157,7 +181,6 @@ client.on('channelDelete', async (channel) => {
 
         const reason = isCategory ? 'حذف كاتوقري' : 'حذف روم';
 
-        // Revert: recreate the deleted channel/category
         const overwrites = channel.permissionOverwrites?.cache?.map((o) => ({
             id: o.id,
             type: o.type,
@@ -184,7 +207,9 @@ client.on('channelDelete', async (channel) => {
             }
         }
 
-        await channel.guild.channels.create(createOptions).catch(() => {});
+        await channel.guild.channels.create(createOptions).catch((err) => {
+            console.error('[channelDelete] Failed to recreate channel:', err.message);
+        });
         await punish(channel.guild, executor, reason);
     } catch (err) {
         console.error('[channelDelete]', err.message);
@@ -197,9 +222,11 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
         const isCategory = newChannel.type === ChannelType.GuildCategory;
 
         const nameChanged = oldChannel.name !== newChannel.name;
-        const positionChanged = oldChannel.rawPosition !== newChannel.rawPosition;
+        // Use both rawPosition and position to catch all move events
+        const positionChanged =
+            oldChannel.rawPosition !== newChannel.rawPosition ||
+            oldChannel.position !== newChannel.position;
 
-        // Check permission overwrites diff
         const oldPerms = oldChannel.permissionOverwrites?.cache;
         const newPerms = newChannel.permissionOverwrites?.cache;
         let permChanged = false;
@@ -227,6 +254,8 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
         if (!nameChanged && !positionChanged && !permChanged) return;
 
+        console.log(`[channelUpdate] #${newChannel.name} — name:${nameChanged} pos:${positionChanged} perm:${permChanged} category:${isCategory}`);
+
         let reason;
         if (nameChanged) {
             reason = 'غير اسم روم او شات';
@@ -245,12 +274,13 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
         const executor = await getAuditExecutor(newChannel.guild, AuditLogEvent.ChannelUpdate, newChannel.id);
         if (!executor || isIgnored(executor.id)) return;
 
-        // Revert
         if (nameChanged) {
             await newChannel.setName(oldChannel.name, 'Protection: reverting name change').catch(() => {});
         }
         if (positionChanged) {
-            await newChannel.setPosition(oldChannel.rawPosition, { reason: 'Protection: reverting position change' }).catch(() => {});
+            await newChannel.setPosition(oldChannel.rawPosition, { reason: 'Protection: reverting position change' }).catch((err) => {
+                console.error('[channelUpdate] Failed to revert position:', err.message);
+            });
         }
         if (permChanged && oldPerms) {
             const oldOverwrites = oldPerms.map((o) => ({
@@ -270,9 +300,29 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
 
 // ─── Ready ─────────────────────────────────────────────────────────────────
 
-client.once('clientReady', () => {
+client.once('clientReady', async () => {
     console.log(`[Bot] Online as ${client.user.tag}`);
     console.log(`[Bot] Protection system active`);
+
+    // Check required permissions on startup
+    for (const guild of client.guilds.cache.values()) {
+        const me = await guild.members.fetchMe().catch(() => null);
+        if (!me) continue;
+        const perms = me.permissions;
+        const checks = {
+            'VIEW_AUDIT_LOG': perms.has('ViewAuditLog'),
+            'MANAGE_ROLES': perms.has('ManageRoles'),
+            'MANAGE_CHANNELS': perms.has('ManageChannels'),
+            'SEND_MESSAGES': perms.has('SendMessages'),
+        };
+        console.log(`[Bot] Permissions in "${guild.name}":`, checks);
+        const missing = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+        if (missing.length > 0) {
+            console.warn(`[Bot] ⚠️  MISSING PERMISSIONS: ${missing.join(', ')}`);
+        } else {
+            console.log(`[Bot] All required permissions present ✓`);
+        }
+    }
 });
 
 // ─── Login ─────────────────────────────────────────────────────────────────
