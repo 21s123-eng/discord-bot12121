@@ -72,6 +72,8 @@ async function punish(guild, executor, reason) {
     } catch {}
 }
 
+// ─── Role Events ───────────────────────────────────────────────────────────
+
 client.on('roleCreate', async (role) => {
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleCreate, role.id);
@@ -85,14 +87,20 @@ client.on('roleDelete', async (role) => {
     try {
         const executor = await getAuditExecutor(role.guild, AuditLogEvent.RoleDelete, role.id);
         if (!executor || isIgnored(executor.id)) return;
-        await role.guild.roles.create({
+        // Recreate the role then restore its exact original position
+        const newRole = await role.guild.roles.create({
             name: role.name,
             color: role.color,
             hoist: role.hoist,
             permissions: role.permissions,
             mentionable: role.mentionable,
             reason: 'Protection: reverting unauthorized role deletion',
-        }).catch(() => {});
+        }).catch(() => null);
+        if (newRole) {
+            await role.guild.roles.setPositions([
+                { role: newRole.id, position: role.rawPosition },
+            ]).catch(() => {});
+        }
         await punish(role.guild, executor, 'حذف رتبه');
     } catch {}
 });
@@ -128,6 +136,18 @@ client.on('roleUpdate', async (oldRole, newRole) => {
         }
 
         await punish(newRole.guild, executor, reason);
+    } catch {}
+});
+
+// ─── Channel Events ────────────────────────────────────────────────────────
+
+client.on('channelCreate', async (channel) => {
+    if (!channel.guild) return;
+    try {
+        const executor = await getAuditExecutor(channel.guild, AuditLogEvent.ChannelCreate, channel.id);
+        if (!executor || isIgnored(executor.id)) return;
+        await channel.delete('Protection: reverting unauthorized channel creation').catch(() => {});
+        await punish(channel.guild, executor, 'حذف روم');
     } catch {}
 });
 
@@ -219,9 +239,13 @@ client.on('channelUpdate', async (oldChannel, newChannel) => {
     } catch {}
 });
 
+// ─── Ready ─────────────────────────────────────────────────────────────────
+
 client.once('clientReady', () => {
     console.log(`[Bot] Online as ${client.user.tag}`);
     console.log(`[Bot] Protection system active`);
 });
+
+// ─── Login ─────────────────────────────────────────────────────────────────
 
 client.login(process.env.TOKEN);
