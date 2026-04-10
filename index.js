@@ -12,7 +12,7 @@ const TOKEN = process.env.TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-// يمنع التكرار (سبام)
+// منع السبام
 const cooldown = new Map();
 
 function isOwner(id) {
@@ -21,10 +21,9 @@ function isOwner(id) {
 
 async function sendLog(guild, member, reasonText) {
   const key = `${guild.id}-${member.id}`;
-
   if (cooldown.has(key)) return;
-  cooldown.set(key, true);
 
+  cooldown.set(key, true);
   setTimeout(() => cooldown.delete(key), 5000);
 
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
@@ -35,9 +34,7 @@ async function sendLog(guild, member, reasonText) {
 
 the reason : ${reasonText}
 
-ID : ${member.id}
-
-@here`
+ID : ${member.id}`
   ).catch(() => {});
 }
 
@@ -50,7 +47,12 @@ async function getExecutor(guild, type) {
 
   const user = entry.executor;
   if (!user) return null;
+
+  // تجاهل الاونر
   if (isOwner(user.id)) return null;
+
+  // 🔥 تجاهل البوت نفسه (حل السبام)
+  if (user.id === client.user.id) return null;
 
   return user;
 }
@@ -115,7 +117,6 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   if (!user) return;
 
   let reason = 'عدل على روم';
-
   if (oldCh.name !== newCh.name) reason = 'غير اسم روم';
 
   try {
