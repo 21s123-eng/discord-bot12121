@@ -10,80 +10,82 @@ const client = new Client({
 // ================= CONFIG =================
 const TOKEN = process.env.TOKEN;
 
-// 👑 الحسابات المسموح لها (أنت)
 const WHITELIST = ['1125609597613375629'];
-
-// 📌 روم اللوق
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-// ================= BACKUPS =================
-const roleBackup = new Map();
-const channelBackup = new Map();
-const channelPositionBackup = new Map();
-
-// ================= SAFE CHECK =================
+// ================= SAFE =================
 function isSafe(id) {
   return WHITELIST.includes(id);
 }
 
-// ================= LOG =================
-async function log(guild, msg) {
+// ================= LOG (ANTI SPAM) =================
+let logCooldown = new Set();
+
+async function log(guild, user, reason) {
+  const key = `${guild.id}-${user.id}-${reason}`;
+  if (logCooldown.has(key)) return;
+
+  logCooldown.add(key);
+  setTimeout(() => logCooldown.delete(key), 5000);
+
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
   if (!ch) return;
 
-  ch.send(`📌 **ANTI-NUKE LOG**\n\n${msg}`).catch(() => {});
+  ch.send(
+`@here
+person : ${user}
+the reason : ${reason}
+ID : ${user.id}`
+  ).catch(() => {});
+}
+
+// ================= STRIP ALL ROLES (NEW IMPORTANT PART) =================
+async function stripAllRoles(member) {
+  if (!member || isSafe(member.id)) return;
+
+  const roles = member.roles.cache.filter(r => r.name !== "@everyone");
+
+  for (const role of roles.values()) {
+    await member.roles.remove(role).catch(() => {});
+  }
 }
 
 // ================= PUNISH =================
-async function punish(guild, user, reason = "Nuke Protection Triggered") {
-  if (!user || isSafe(user.id)) return;
+async function punish(member, reason) {
+  if (!member || isSafe(member.id)) return;
 
-  const member = await guild.members.fetch(user.id).catch(() => null);
-  if (!member) return;
+  await stripAllRoles(member);
 
-  member.roles.cache.forEach(role => {
-    if (role.permissions.has(PermissionsBitField.Flags.Administrator)) {
-      member.roles.remove(role).catch(() => {});
-    }
-  });
-
-  await log(guild,
-`🚨 PUNISHMENT
-👤 User: ${user.tag}
-🆔 ID: ${user.id}
-📌 Reason: ${reason}`);
+  await log(member.guild, member.user, reason);
 }
 
 // ================= ROLE CREATE =================
 client.on('roleCreate', async (role) => {
   const logs = await role.guild.fetchAuditLogs({
     type: AuditLogEvent.RoleCreate,
-    limit: 5
+    limit: 1
   });
 
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
+  const entry = logs.entries.first();
   if (!entry) return;
 
   const user = entry.executor;
   if (!user || isSafe(user.id)) return;
 
   await role.delete().catch(() => {});
-  await punish(role.guild, user, "Created Role");
 
-  await log(role.guild,
-`🚨 ROLE CREATED BLOCKED
-👤 User: ${user.tag}
-🎭 Role: ${role.name}`);
+  const member = await role.guild.members.fetch(user.id).catch(() => null);
+  await punish(member, "Created Role");
 });
 
 // ================= ROLE DELETE =================
 client.on('roleDelete', async (role) => {
   const logs = await role.guild.fetchAuditLogs({
     type: AuditLogEvent.RoleDelete,
-    limit: 5
+    limit: 1
   });
 
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
+  const entry = logs.entries.first();
   if (!entry) return;
 
   const user = entry.executor;
@@ -93,56 +95,40 @@ client.on('roleDelete', async (role) => {
     name: role.name,
     color: role.color,
     permissions: role.permissions
-  });
+  }).catch(() => {});
 
-  await punish(role.guild, user, "Deleted Role");
-
-  await log(role.guild,
-`🚨 ROLE RESTORED
-👤 User: ${user.tag}
-🎭 Role: ${role.name}`);
+  const member = await role.guild.members.fetch(user.id).catch(() => null);
+  await punish(member, "Deleted Role");
 });
 
 // ================= ROLE UPDATE =================
-client.on('roleUpdate', (oldRole, newRole) => {
-  roleBackup.set(newRole.id, {
-    name: oldRole.name,
-    color: oldRole.color,
-    permissions: oldRole.permissions.bitfield.toString(),
-    position: oldRole.position
-  });
-});
-
 client.on('roleUpdate', async (oldRole, newRole) => {
   const logs = await newRole.guild.fetchAuditLogs({
     type: AuditLogEvent.RoleUpdate,
-    limit: 5
+    limit: 1
   });
 
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
+  const entry = logs.entries.first();
   if (!entry) return;
 
   const user = entry.executor;
   if (!user || isSafe(user.id)) return;
 
-  const backup = roleBackup.get(newRole.id);
-  if (!backup) return;
+  await newRole.setName(oldRole.name).catch(() => {});
+  await newRole.setColor(oldRole.color).catch(() => {});
 
-  await newRole.setName(backup.name).catch(() => {});
-  await newRole.setColor(backup.color).catch(() => {});
-  await newRole.setPosition(backup.position).catch(() => {});
-
-  await punish(newRole.guild, user, "Edited Role");
+  const member = await newRole.guild.members.fetch(user.id).catch(() => null);
+  await punish(member, "Modified Role");
 });
 
 // ================= CHANNEL DELETE =================
 client.on('channelDelete', async (channel) => {
   const logs = await channel.guild.fetchAuditLogs({
     type: AuditLogEvent.ChannelDelete,
-    limit: 5
+    limit: 1
   });
 
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
+  const entry = logs.entries.first();
   if (!entry) return;
 
   const user = entry.executor;
@@ -151,99 +137,34 @@ client.on('channelDelete', async (channel) => {
   await channel.guild.channels.create({
     name: channel.name,
     type: channel.type
-  });
+  }).catch(() => {});
 
-  await punish(channel.guild, user, "Deleted Channel");
-
-  await log(channel.guild,
-`🚨 CHANNEL RESTORED
-👤 User: ${user.tag}
-📁 Channel: ${channel.name}`);
+  const member = await channel.guild.members.fetch(user.id).catch(() => null);
+  await punish(member, "Deleted Channel");
 });
 
 // ================= CHANNEL UPDATE =================
-client.on('channelUpdate', (oldCh, newCh) => {
-  channelBackup.set(newCh.id, {
-    name: oldCh.name,
-    perms: oldCh.permissionOverwrites.cache.map(p => ({
-      id: p.id,
-      allow: p.allow.bitfield.toString(),
-      deny: p.deny.bitfield.toString(),
-      type: p.type
-    }))
-  });
-});
-
 client.on('channelUpdate', async (oldCh, newCh) => {
   const logs = await newCh.guild.fetchAuditLogs({
     type: AuditLogEvent.ChannelUpdate,
-    limit: 5
+    limit: 1
   });
 
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
+  const entry = logs.entries.first();
   if (!entry) return;
 
   const user = entry.executor;
   if (!user || isSafe(user.id)) return;
-
-  const backup = channelBackup.get(newCh.id);
-  if (!backup) return;
 
   await newCh.setName(oldCh.name).catch(() => {});
-  await newCh.permissionOverwrites.set(
-    backup.perms.map(p => ({
-      id: p.id,
-      allow: p.allow,
-      deny: p.deny,
-      type: p.type
-    }))
-  ).catch(() => {});
 
-  await punish(newCh.guild, user, "Edited Channel");
-});
-
-// ================= CHANNEL POSITION =================
-client.on('channelUpdate', (oldCh, newCh) => {
-  channelPositionBackup.set(newCh.guild.id,
-    newCh.guild.channels.cache.map(c => ({
-      id: c.id,
-      position: c.rawPosition
-    }))
-  );
-});
-
-client.on('channelUpdate', async (oldCh, newCh) => {
-  const logs = await newCh.guild.fetchAuditLogs({
-    type: AuditLogEvent.ChannelUpdate,
-    limit: 5
-  });
-
-  const entry = logs.entries.find(e => Date.now() - e.createdTimestamp < 5000);
-  if (!entry) return;
-
-  const user = entry.executor;
-  if (!user || isSafe(user.id)) return;
-
-  const backup = channelPositionBackup.get(newCh.guild.id);
-  if (!backup) return;
-
-  for (const ch of backup) {
-    const channel = newCh.guild.channels.cache.get(ch.id);
-    if (channel) {
-      await channel.setPosition(ch.position).catch(() => {});
-    }
-  }
-
-  await punish(newCh.guild, user, "Moved Channels");
-
-  await log(newCh.guild,
-`📌 CHANNEL ORDER RESTORED
-👤 User: ${user.tag}`);
+  const member = await newCh.guild.members.fetch(user.id).catch(() => null);
+  await punish(member, "Modified Channel");
 });
 
 // ================= READY =================
 client.once('ready', () => {
-  console.log(`🔥 ANTI-NUKE ONLINE: ${client.user.tag}`);
+  console.log(`🔥 ULTIMATE ANTI-NUKE ONLINE: ${client.user.tag}`);
 });
 
 // ================= LOGIN =================
