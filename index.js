@@ -3,8 +3,7 @@ const { Client, GatewayIntentBits, AuditLogEvent, ChannelType, PermissionsBitFie
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMembers
   ]
 });
 
@@ -13,90 +12,59 @@ const TOKEN = process.env.TOKEN;
 const OWNER_ID = '1125609597613375629';
 const LOG_CHANNEL_ID = '1492108809618063432';
 
-// ================= BACKUP STORAGE =================
+// ================= CACHE BACKUP =================
 const backup = {
   roles: new Map(),
   channels: new Map()
 };
 
+// ================= ANTI FLOOD =================
 const cooldown = new Map();
+const raidTracker = new Map();
 
-function logSend(guild, text) {
+function isOwner(id) {
+  return id === OWNER_ID;
+}
+
+// ================= LOG SYSTEM =================
+async function log(guild, user, reason) {
+  const key = guild.id + user.id;
+  if (cooldown.has(key)) return;
+
+  cooldown.set(key, true);
+  setTimeout(() => cooldown.delete(key), 5000);
+
   const ch = guild.channels.cache.get(LOG_CHANNEL_ID);
   if (!ch) return;
 
-  ch.send(text + "\n@here").catch(()=>{});
+  ch.send(
+`person : <@${user.id}>
+
+the reason : ${reason}
+
+ID : ${user.id}
+
+@here`
+  ).catch(()=>{});
 }
 
-// ================= SAVE ROLE =================
-function saveRoles(guild) {
-  const roles = guild.roles.cache.map(r => ({
-    id: r.id,
-    name: r.name,
-    color: r.color,
-    permissions: r.permissions.bitfield,
-    position: r.position
-  }));
-  backup.roles.set(guild.id, roles);
-}
+// ================= RAID DETECTOR =================
+function checkRaid(userId, guildId) {
+  const key = guildId + userId;
 
-// ================= SAVE CHANNEL =================
-function saveChannels(guild) {
-  const channels = guild.channels.cache.map(c => ({
-    id: c.id,
-    name: c.name,
-    type: c.type,
-    parentId: c.parentId,
-    position: c.position,
-    permissionOverwrites: c.permissionOverwrites.cache.map(p => ({
-      id: p.id,
-      allow: p.allow.bitfield,
-      deny: p.deny.bitfield
-    }))
-  }));
-  backup.channels.set(guild.id, channels);
-}
+  const now = Date.now();
+  const data = raidTracker.get(key) || { count: 0, time: now };
 
-// ================= PUNISH =================
-async function punish(member) {
-  if (!member || member.id === OWNER_ID) return;
-
-  const roles = member.roles.cache.filter(r => r.id !== member.guild.id);
-  for (const r of roles.values()) {
-    await member.roles.remove(r).catch(()=>{});
+  if (now - data.time < 5000) {
+    data.count++;
+  } else {
+    data.count = 1;
+    data.time = now;
   }
-}
 
-// ================= RESTORE ROLES =================
-async function restoreRoles(guild) {
-  const roles = backup.roles.get(guild.id);
-  if (!roles) return;
+  raidTracker.set(key, data);
 
-  for (const r of roles) {
-    if (!guild.roles.cache.get(r.id)) {
-      await guild.roles.create({
-        name: r.name,
-        color: r.color,
-        permissions: new PermissionsBitField(r.permissions)
-      }).catch(()=>{});
-    }
-  }
-}
-
-// ================= RESTORE CHANNELS =================
-async function restoreChannels(guild) {
-  const channels = backup.channels.get(guild.id);
-  if (!channels) return;
-
-  for (const c of channels) {
-    if (!guild.channels.cache.get(c.id)) {
-      await guild.channels.create({
-        name: c.name,
-        type: c.type,
-        parent: c.parentId
-      }).catch(()=>{});
-    }
-  }
+  return data.count >= 3; // 3 عمليات خلال 5 ثواني = رايد
 }
 
 // ================= GET EXECUTOR =================
@@ -111,21 +79,74 @@ async function getUser(guild, type) {
   if (!user) return null;
 
   if (user.id === client.user.id) return null;
-  if (user.id === OWNER_ID) return null;
+  if (isOwner(user.id)) return null;
 
   if (Date.now() - entry.createdTimestamp > 4000) return null;
 
   return user;
 }
 
+// ================= STRIP ROLES =================
+async function punish(member) {
+  if (!member) return;
+
+  const roles = member.roles.cache.filter(r => r.id !== member.guild.id);
+  for (const r of roles.values()) {
+    await member.roles.remove(r).catch(()=>{});
+  }
+}
+
+// ================= BACKUP =================
+function saveGuild(guild) {
+  backup.roles.set(guild.id, guild.roles.cache.map(r => ({
+    name: r.name,
+    color: r.color,
+    permissions: r.permissions.bitfield,
+    position: r.position
+  })));
+
+  backup.channels.set(guild.id, guild.channels.cache.map(c => ({
+    name: c.name,
+    type: c.type,
+    parentId: c.parentId
+  })));
+}
+
+// ================= RESTORE =================
+async function restore(guild) {
+  const roles = backup.roles.get(guild.id);
+  const channels = backup.channels.get(guild.id);
+
+  if (roles) {
+    for (const r of roles) {
+      if (!guild.roles.cache.find(x => x.name === r.name)) {
+        await guild.roles.create({
+          name: r.name,
+          color: r.color,
+          permissions: new PermissionsBitField(r.permissions)
+        }).catch(()=>{});
+      }
+    }
+  }
+
+  if (channels) {
+    for (const c of channels) {
+      if (!guild.channels.cache.find(x => x.name === c.name)) {
+        await guild.channels.create({
+          name: c.name,
+          type: c.type,
+          parent: c.parentId
+        }).catch(()=>{});
+      }
+    }
+  }
+}
+
 // ================= READY =================
-client.once('ready', async () => {
+client.once('ready', () => {
   console.log(`ONLINE: ${client.user.tag}`);
 
-  client.guilds.cache.forEach(guild => {
-    saveRoles(guild);
-    saveChannels(guild);
-  });
+  client.guilds.cache.forEach(saveGuild);
 });
 
 // ================= ROLE CREATE =================
@@ -136,11 +157,11 @@ client.on('roleCreate', async role => {
   await role.delete().catch(()=>{});
 
   const member = await role.guild.members.fetch(user.id).catch(()=>null);
+
   await punish(member);
+  await restore(role.guild);
 
-  restoreRoles(role.guild);
-
-  logSend(role.guild, `person : <@${user.id}>\n\nthe reason : created role\n\nID : ${user.id}`);
+  log(role.guild, user, 'created role');
 });
 
 // ================= ROLE UPDATE =================
@@ -149,15 +170,14 @@ client.on('roleUpdate', async (oldRole, newRole) => {
   if (!user) return;
 
   await newRole.setName(oldRole.name).catch(()=>{});
-  await newRole.setColor(oldRole.color).catch(()=>{});
   await newRole.setPermissions(oldRole.permissions).catch(()=>{});
 
   const member = await newRole.guild.members.fetch(user.id).catch(()=>null);
+
   await punish(member);
+  await restore(newRole.guild);
 
-  restoreRoles(newRole.guild);
-
-  logSend(newRole.guild, `person : <@${user.id}>\n\nthe reason : role update\n\nID : ${user.id}`);
+  log(newRole.guild, user, 'role update');
 });
 
 // ================= CHANNEL UPDATE =================
@@ -169,11 +189,11 @@ client.on('channelUpdate', async (oldCh, newCh) => {
   await newCh.setParent(oldCh.parentId).catch(()=>{});
 
   const member = await newCh.guild.members.fetch(user.id).catch(()=>null);
+
   await punish(member);
+  await restore(newCh.guild);
 
-  restoreChannels(newCh.guild);
-
-  logSend(newCh.guild, `person : <@${user.id}>\n\nthe reason : channel update\n\nID : ${user.id}`);
+  log(newCh.guild, user, 'channel update');
 });
 
 // ================= CHANNEL DELETE =================
@@ -181,12 +201,20 @@ client.on('channelDelete', async channel => {
   const user = await getUser(channel.guild, AuditLogEvent.ChannelDelete);
   if (!user) return;
 
-  await restoreChannels(channel.guild);
+  await restore(channel.guild);
 
   const member = await channel.guild.members.fetch(user.id).catch(()=>null);
+
   await punish(member);
 
-  logSend(channel.guild, `person : <@${user.id}>\n\nthe reason : channel delete\n\nID : ${user.id}`);
+  log(channel.guild, user, 'channel delete');
+});
+
+// ================= RAID MASS JOIN =================
+client.on('guildMemberAdd', async member => {
+  if (checkRaid(member.id, member.guild.id)) {
+    await punish(member).catch(()=>{});
+  }
 });
 
 client.login(TOKEN);
